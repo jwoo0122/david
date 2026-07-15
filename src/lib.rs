@@ -1,5 +1,5 @@
-use dialoguer::{Select, theme::ColorfulTheme};
-use serde::Deserialize;
+use dialoguer::{Input, Select, theme::ColorfulTheme};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env,
@@ -21,6 +21,8 @@ pub enum ToolError {
     Io(#[from] io::Error),
     #[error("configuration parse error: {0}")]
     ConfigParse(#[from] toml::de::Error),
+    #[error("configuration serialization error: {0}")]
+    ConfigSerialize(#[from] toml::ser::Error),
     #[error("{program} failed: {detail}")]
     Command { program: String, detail: String },
 }
@@ -54,6 +56,20 @@ impl TonyPaths {
         &self.config
     }
 
+    pub fn setup(&self) -> Result<()> {
+        self.setup_with(TerminalSetupPrompter)
+    }
+
+    fn setup_with<P: SetupPrompter>(&self, prompter: P) -> Result<()> {
+        let config = Config::load_or_default(&self.config)?;
+        let config = prompter.collect(config)?;
+        config.validate()?;
+        self.prepare()?;
+        write_config(&self.config, &config)?;
+        println!("Agent configuration written to {}", self.config.display());
+        Ok(())
+    }
+
     fn prepare(&self) -> Result<()> {
         fs::create_dir_all(&self.worktrees)?;
         fs::create_dir_all(&self.sessions)?;
@@ -74,14 +90,14 @@ impl TonyPaths {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Agent {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
     #[serde(default)]
     pub agents: BTreeMap<String, Agent>,
@@ -120,6 +136,13 @@ impl SessionState {
 }
 
 impl Config {
+    fn load_or_default(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Self::load(path)
+    }
+
     fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -158,6 +181,77 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    fn add_or_replace(&mut self, name: String, agent: Agent) -> Result<()> {
+        let mut candidate = self.clone();
+        candidate.agents.insert(name, agent);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+}
+
+trait SetupPrompter {
+    fn collect(&self, config: Config) -> Result<Config>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TerminalSetupPrompter;
+
+impl SetupPrompter for TerminalSetupPrompter {
+    fn collect(&self, mut config: Config) -> Result<Config> {
+        print_agents(&config);
+        loop {
+            let name = prompt_text("Agent name (Enter to finish)", true)?;
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                break;
+            }
+
+            let command = prompt_text("Command", false)?.trim().to_owned();
+            let args = loop {
+                let raw = prompt_text("Arguments (optional)", true)?;
+                match parse_agent_arguments(&raw) {
+                    Ok(args) => break args,
+                    Err(error) => eprintln!("Invalid arguments: {error}"),
+                }
+            };
+
+            config.add_or_replace(name, Agent { command, args })?;
+            print_agents(&config);
+        }
+        Ok(config)
+    }
+}
+
+fn prompt_text(prompt: &str, allow_empty: bool) -> Result<String> {
+    let theme = ColorfulTheme::default();
+    let input = Input::<String>::with_theme(&theme).with_prompt(prompt);
+    let input = if allow_empty {
+        input.allow_empty(true)
+    } else {
+        input
+    };
+    input
+        .interact_text()
+        .map_err(io::Error::from)
+        .map_err(Into::into)
+}
+
+fn parse_agent_arguments(raw: &str) -> Result<Vec<String>> {
+    shell_words::split(raw)
+        .map_err(|error| ToolError::Message(format!("could not parse agent arguments: {error}")))
+}
+
+fn print_agents(config: &Config) {
+    println!("\nConfigured agents:");
+    if config.agents.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    for (name, agent) in &config.agents {
+        println!("  {name}: {} {:?}", agent.command, agent.args);
     }
 }
 
@@ -772,6 +866,23 @@ fn session_name(repo_id: &str, worktree_name: &str) -> String {
     format!("tony-{repo_id}-{}", stable_hash(worktree_name))
 }
 
+fn write_config(path: &Path, config: &Config) -> Result<()> {
+    let temporary = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml"),
+        std::process::id()
+    ));
+    let content = toml::to_string_pretty(config)?;
+    fs::write(&temporary, content)?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(ToolError::Io(error));
+    }
+    Ok(())
+}
+
 fn write_session_state(path: &Path, state: &SessionState) -> Result<()> {
     let temporary = path.with_file_name(format!(
         ".{}.tmp-{}",
@@ -936,6 +1047,27 @@ mod tests {
         App::with_picker(paths, sessions, FirstAgentPicker)
     }
 
+    struct ScriptedSetup {
+        additions: Vec<(String, Agent)>,
+    }
+
+    impl SetupPrompter for ScriptedSetup {
+        fn collect(&self, mut config: Config) -> Result<Config> {
+            for (name, agent) in &self.additions {
+                config.add_or_replace(name.clone(), agent.clone())?;
+            }
+            Ok(config)
+        }
+    }
+
+    struct EmptySetup;
+
+    impl SetupPrompter for EmptySetup {
+        fn collect(&self, _config: Config) -> Result<Config> {
+            Ok(Config::default())
+        }
+    }
+
     fn init_repo() -> TempDir {
         let directory = tempfile::tempdir().expect("temp repo");
         run_git(directory.path(), &["init", "-q"]);
@@ -999,6 +1131,70 @@ mod tests {
         assert!(validate_worktree_name("../escape").is_err());
         assert!(validate_worktree_name("/absolute").is_err());
         assert!(validate_worktree_name("feature/login").is_ok());
+    }
+
+    #[test]
+    fn parses_quoted_agent_arguments() {
+        assert_eq!(
+            parse_agent_arguments("--model gpt-5 --prompt 'hello world'").unwrap(),
+            vec!["--model", "gpt-5", "--prompt", "hello world"]
+        );
+    }
+
+    #[test]
+    fn setup_merges_agents_and_scaffolds_config() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = TonyPaths::from_home(home.path());
+        fs::create_dir_all(paths.config_path().parent().unwrap()).unwrap();
+        fs::write(
+            paths.config_path(),
+            "[agents.keep]\ncommand = \"keep\"\nargs = []\n\n[agents.existing]\ncommand = \"old\"\nargs = [\"old\"]\n",
+        )
+        .unwrap();
+
+        paths
+            .setup_with(ScriptedSetup {
+                additions: vec![
+                    (
+                        "existing".to_owned(),
+                        Agent {
+                            command: "new".to_owned(),
+                            args: vec!["value".to_owned()],
+                        },
+                    ),
+                    (
+                        "added".to_owned(),
+                        Agent {
+                            command: "added".to_owned(),
+                            args: vec![],
+                        },
+                    ),
+                ],
+            })
+            .unwrap();
+
+        assert!(paths.config_path().is_file());
+        assert!(paths.worktrees.is_dir());
+        assert!(paths.sessions.is_dir());
+        let config = Config::load(paths.config_path()).unwrap();
+        assert_eq!(config.agents.len(), 3);
+        assert_eq!(config.agents["keep"].command, "keep");
+        assert_eq!(config.agents["existing"].command, "new");
+        assert_eq!(config.agents["existing"].args, vec!["value"]);
+        assert_eq!(config.agents["added"].command, "added");
+    }
+
+    #[test]
+    fn setup_rejects_empty_result_without_writing_config() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = TonyPaths::from_home(home.path());
+
+        let error = paths.setup_with(EmptySetup).unwrap_err();
+
+        assert!(error.to_string().contains("at least one agent"));
+        assert!(!paths.config_path().exists());
+        assert!(!paths.worktrees.exists());
+        assert!(!paths.sessions.exists());
     }
 
     #[test]

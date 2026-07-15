@@ -1,6 +1,22 @@
 version: 1
 generated_by: maintain-architecture-decisions
 decisions:
+  - id: configuration.agent-setup
+    status: accepted
+    scope: configuration
+    decision_type: workflow
+    summary: The setup command interactively creates or merges the user-scoped agent
+      configuration without requiring a project repository.
+    applies_to:
+      - setup command
+      - agent configuration creation and update
+    file: records/configuration/agent-setup.md
+    constrains: []
+    depends_on:
+      - runtime.agent-session
+    supersedes: []
+    superseded_by: []
+    last_reviewed: '2026-07-16'
   - id: runtime.agent-session
     status: accepted
     scope: runtime

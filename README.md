@@ -26,6 +26,16 @@ args = []
 
 Commands are executed directly, not through a shell. Put flags in `args`.
 
+## First-time setup
+
+Run setup from any directory:
+
+```text
+tony setup
+```
+
+It asks for an agent name, command, and optional arguments. Enter arguments as one shell-like line, for example `--model gpt-5 --profile "fast mode"`. After each agent, the complete configured list is shown. Press `Enter` at the agent-name prompt to finish. Existing agents are preserved, and entering the same name updates that agent.
+
 ## Usage
 
 Run from any directory inside the source Git repository:

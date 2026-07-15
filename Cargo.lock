@@ -401,6 +401,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "serde",
+ "shell-words",
  "tempfile",
  "thiserror",
  "toml",
