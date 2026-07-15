@@ -10,6 +10,20 @@
 
 The first version targets macOS and Linux.
 
+## Install
+
+Install the prebuilt binary with Homebrew:
+
+```text
+brew install jwoo0122/tap/tony
+```
+
+Alternatively, install from crates.io with Cargo:
+
+```text
+cargo install tony
+```
+
 ## Agent configuration
 
 Create `~/.tony/config.toml`:
@@ -73,29 +87,3 @@ Use `--force` only when the worktree's uncommitted changes should be discarded:
 ```text
 tony remove feature-login --force
 ```
-
-## Releases
-
-The package starts at version `1.0.0`. Pushes to `main` are inspected for Conventional Commits:
-
-- `feat` creates a minor release.
-- `fix` and `perf` create a patch release.
-- `BREAKING CHANGE` or `!` creates a major release.
-- `docs`, `chore`, `test`, and `refactor` do not create a release unless they are breaking.
-
-The workflow adds a `chore(release): v<version>` commit and matching tag, then publishes the crate, GitHub Release artifacts, and the Homebrew formula.
-
-The `tony` repository must have these Actions secrets:
-
-- `CARGO_TOKEN`: crates.io API token.
-- `HOMEBREW_TAP_TOKEN`: a GitHub token with write access to `jwoo0122/homebrew-tap`.
-
-Repository Actions settings must allow `Read and write permissions`, because the version-bump workflow pushes the release commit and tag to `main`.
-
-Homebrew users can install the prebuilt binary with:
-
-```text
-brew install jwoo0122/tap/tony
-```
-
-If a GitHub Release succeeds but crates.io publication fails, run the `Publish crate` workflow with the release commit SHA and version to retry only the crate publication.
