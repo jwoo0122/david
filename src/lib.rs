@@ -25,16 +25,16 @@ pub enum ToolError {
 }
 
 #[derive(Clone, Debug)]
-pub struct ToolPaths {
+pub struct TonyPaths {
     worktrees: PathBuf,
     sessions: PathBuf,
     config: PathBuf,
 }
 
-impl ToolPaths {
+impl TonyPaths {
     pub fn from_home(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
-        let root = home.join(".tool");
+        let root = home.join(".tony");
         Self {
             worktrees: root.join("worktrees"),
             sessions: root.join("sessions"),
@@ -481,13 +481,13 @@ impl SessionBackend for TmuxBackend {
 }
 
 pub struct App<S> {
-    paths: ToolPaths,
+    paths: TonyPaths,
     git: Git,
     sessions: S,
 }
 
 impl<S: SessionBackend> App<S> {
-    pub fn new(paths: ToolPaths, sessions: S) -> Self {
+    pub fn new(paths: TonyPaths, sessions: S) -> Self {
         Self {
             paths,
             git: Git::default(),
@@ -543,7 +543,7 @@ impl<S: SessionBackend> App<S> {
                 read_session_state(&state_path)?
             } else {
                 return Err(ToolError::Message(format!(
-                    "tmux session {session} exists but is not managed by tool"
+                    "tmux session {session} exists but is not managed by tony"
                 )));
             };
             if !state.matches(&repo_id, name, &target, &session) {
@@ -686,7 +686,7 @@ impl<S: SessionBackend> App<S> {
             }
         } else if live {
             return Err(ToolError::Message(format!(
-                "tmux session {session} exists but is not managed by tool"
+                "tmux session {session} exists but is not managed by tony"
             )));
         }
         if live {
@@ -769,7 +769,7 @@ pub fn stable_hash(value: &str) -> String {
 }
 
 fn session_name(repo_id: &str, worktree_name: &str) -> String {
-    format!("tool-{repo_id}-{}", stable_hash(worktree_name))
+    format!("tony-{repo_id}-{}", stable_hash(worktree_name))
 }
 
 fn write_session_state(path: &Path, state: &SessionState) -> Result<()> {
@@ -941,8 +941,8 @@ mod tests {
         assert!(status.success(), "git command failed: {args:?}");
     }
 
-    fn configured_paths(home: &Path) -> ToolPaths {
-        let paths = ToolPaths::from_home(home);
+    fn configured_paths(home: &Path) -> TonyPaths {
+        let paths = TonyPaths::from_home(home);
         fs::create_dir_all(paths.config_path().parent().unwrap()).unwrap();
         fs::write(
             paths.config_path(),
@@ -1113,7 +1113,7 @@ mod tests {
             return;
         }
 
-        let session = format!("tool-test-{}-{}", std::process::id(), stable_hash("tmux"));
+        let session = format!("tony-test-{}-{}", std::process::id(), stable_hash("tmux"));
         let directory = tempfile::tempdir().unwrap();
         let backend = TmuxBackend::default();
         let agent = Agent {
