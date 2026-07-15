@@ -42,6 +42,8 @@ If the worktree does not exist, `tony` creates a new branch from the current `HE
 
 If a live agent session already exists, `tony run` attaches to it. Otherwise it shows the configured agent list and starts the selected agent.
 
+Move focus with the up/down arrow keys and press `Enter` to select an agent.
+
 List managed worktrees and agents:
 
 ```text

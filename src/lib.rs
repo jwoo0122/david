@@ -1,10 +1,11 @@
+use dialoguer::{Select, theme::ColorfulTheme};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
     fs,
-    io::{self, BufRead, Write},
+    io::{self, Write},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output},
 };
@@ -158,33 +159,30 @@ impl Config {
         }
         Ok(())
     }
+}
 
-    fn pick<R: BufRead, W: Write>(&self, input: &mut R, output: &mut W) -> Result<(String, Agent)> {
-        let choices: Vec<(&String, &Agent)> = self.agents.iter().collect();
-        loop {
-            writeln!(output, "Select an agent:")?;
-            for (index, (name, agent)) in choices.iter().enumerate() {
-                writeln!(output, "  {}. {} ({})", index + 1, name, agent.command)?;
-            }
-            write!(output, "Choice: ")?;
-            output.flush()?;
+pub trait AgentPicker {
+    fn pick(&self, config: &Config) -> Result<(String, Agent)>;
+}
 
-            let mut line = String::new();
-            if input.read_line(&mut line)? == 0 {
-                return Err(ToolError::Message(
-                    "agent selection requires an interactive input".to_owned(),
-                ));
-            }
-            let index = match line.trim().parse::<usize>() {
-                Ok(index) if (1..=choices.len()).contains(&index) => index - 1,
-                _ => {
-                    writeln!(output, "Choose a number from 1 to {}.", choices.len())?;
-                    continue;
-                }
-            };
-            let (name, agent) = choices[index];
-            return Ok((name.clone(), agent.clone()));
-        }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminalAgentPicker;
+
+impl AgentPicker for TerminalAgentPicker {
+    fn pick(&self, config: &Config) -> Result<(String, Agent)> {
+        let choices: Vec<(&String, &Agent)> = config.agents.iter().collect();
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(name, agent)| format!("{name} ({})", agent.command))
+            .collect();
+        let index = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select an agent")
+            .items(&labels)
+            .default(0)
+            .interact()
+            .map_err(io::Error::from)?;
+        let (name, agent) = choices[index];
+        Ok((name.clone(), agent.clone()))
     }
 }
 
@@ -480,28 +478,30 @@ impl SessionBackend for TmuxBackend {
     }
 }
 
-pub struct App<S> {
+pub struct App<S, P = TerminalAgentPicker> {
     paths: TonyPaths,
     git: Git,
     sessions: S,
+    picker: P,
 }
 
-impl<S: SessionBackend> App<S> {
+impl<S: SessionBackend> App<S, TerminalAgentPicker> {
     pub fn new(paths: TonyPaths, sessions: S) -> Self {
+        Self::with_picker(paths, sessions, TerminalAgentPicker)
+    }
+}
+
+impl<S: SessionBackend, P: AgentPicker> App<S, P> {
+    pub fn with_picker(paths: TonyPaths, sessions: S, picker: P) -> Self {
         Self {
             paths,
             git: Git::default(),
             sessions,
+            picker,
         }
     }
 
-    pub fn run<R: BufRead, W: Write>(
-        &self,
-        cwd: &Path,
-        name: &str,
-        input: &mut R,
-        output: &mut W,
-    ) -> Result<()> {
+    pub fn run(&self, cwd: &Path, name: &str) -> Result<()> {
         self.sessions.ensure_available()?;
         validate_worktree_name(name)?;
 
@@ -564,7 +564,7 @@ impl<S: SessionBackend> App<S> {
         }
 
         let config = Config::load(self.paths.config_path())?;
-        let (agent_name, agent) = config.pick(input, output)?;
+        let (agent_name, agent) = self.picker.pick(&config)?;
         if !command_available(&agent.command) {
             return Err(ToolError::Message(format!(
                 "configured agent command is not available: {}",
@@ -873,7 +873,7 @@ fn command_error(program: &str, output: &Output) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, collections::BTreeSet, io::Cursor, process::Command, rc::Rc};
+    use std::{cell::RefCell, collections::BTreeSet, process::Command, rc::Rc};
     use tempfile::TempDir;
 
     #[derive(Clone, Default)]
@@ -916,6 +916,24 @@ mod tests {
             state.killed.push(name.to_owned());
             Ok(())
         }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct FirstAgentPicker;
+
+    impl AgentPicker for FirstAgentPicker {
+        fn pick(&self, config: &Config) -> Result<(String, Agent)> {
+            config
+                .agents
+                .iter()
+                .next()
+                .map(|(name, agent)| (name.clone(), agent.clone()))
+                .ok_or_else(|| ToolError::Message("no agents configured".to_owned()))
+        }
+    }
+
+    fn test_app(paths: TonyPaths, sessions: FakeSessions) -> App<FakeSessions, FirstAgentPicker> {
+        App::with_picker(paths, sessions, FirstAgentPicker)
     }
 
     fn init_repo() -> TempDir {
@@ -989,12 +1007,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let paths = configured_paths(home.path());
         let sessions = FakeSessions::default();
-        let app = App::new(paths.clone(), sessions.clone());
+        let app = test_app(paths.clone(), sessions.clone());
 
-        let mut input = Cursor::new("1\n");
-        let mut output = Vec::new();
-        app.run(repo.path(), "feature", &mut input, &mut output)
-            .unwrap();
+        app.run(repo.path(), "feature").unwrap();
 
         let id = Git::default().repository_id(repo.path()).unwrap();
         let target = paths.worktree_path(&id, "feature");
@@ -1002,9 +1017,7 @@ mod tests {
         assert_eq!(sessions.state.borrow().created.len(), 1);
         assert_eq!(sessions.state.borrow().attached.len(), 1);
 
-        let mut no_input = Cursor::new(Vec::<u8>::new());
-        app.run(repo.path(), "feature", &mut no_input, &mut Vec::new())
-            .unwrap();
+        app.run(repo.path(), "feature").unwrap();
         assert_eq!(sessions.state.borrow().created.len(), 1);
         assert_eq!(sessions.state.borrow().attached.len(), 2);
     }
@@ -1015,19 +1028,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let paths = configured_paths(home.path());
         let sessions = FakeSessions::default();
-        let app = App::new(paths.clone(), sessions);
+        let app = test_app(paths.clone(), sessions);
 
-        app.run(
-            repo.path(),
-            "first",
-            &mut Cursor::new("1\n"),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        app.run(repo.path(), "first").unwrap();
         let first =
             paths.worktree_path(&Git::default().repository_id(repo.path()).unwrap(), "first");
-        app.run(&first, "second", &mut Cursor::new("1\n"), &mut Vec::new())
-            .unwrap();
+        app.run(&first, "second").unwrap();
 
         let second = paths.worktree_path(
             &Git::default().repository_id(repo.path()).unwrap(),
@@ -1042,15 +1048,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let paths = configured_paths(home.path());
         let sessions = FakeSessions::default();
-        let app = App::new(paths.clone(), sessions.clone());
+        let app = test_app(paths.clone(), sessions.clone());
 
-        app.run(
-            repo.path(),
-            "feature",
-            &mut Cursor::new("1\n"),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        app.run(repo.path(), "feature").unwrap();
         let target = paths.worktree_path(
             &Git::default().repository_id(repo.path()).unwrap(),
             "feature",
@@ -1071,13 +1071,7 @@ mod tests {
             .unwrap();
         assert!(!branch.success());
 
-        app.run(
-            repo.path(),
-            "feature",
-            &mut Cursor::new("1\n"),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        app.run(repo.path(), "feature").unwrap();
         assert!(target.is_dir());
         assert_eq!(sessions.state.borrow().created.len(), 2);
 
@@ -1091,14 +1085,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let paths = configured_paths(home.path());
         let sessions = FakeSessions::default();
-        let app = App::new(paths, sessions);
-        app.run(
-            repo.path(),
-            "feature",
-            &mut Cursor::new("1\n"),
-            &mut Vec::new(),
-        )
-        .unwrap();
+        let app = test_app(paths, sessions);
+        app.run(repo.path(), "feature").unwrap();
 
         let mut output = Vec::new();
         app.list(repo.path(), &mut output).unwrap();

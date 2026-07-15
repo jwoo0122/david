@@ -33,13 +33,7 @@ fn run() -> Result<()> {
     let app = App::new(TonyPaths::from_env()?, TmuxBackend::default());
 
     match cli.command {
-        Command::Run { name } => {
-            let stdin = io::stdin();
-            let mut input = stdin.lock();
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            app.run(&cwd, &name, &mut input, &mut output)
-        }
+        Command::Run { name } => app.run(&cwd, &name),
         Command::List => {
             let stdout = io::stdout();
             let mut output = stdout.lock();
