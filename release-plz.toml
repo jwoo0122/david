@@ -1,0 +1,8 @@
+[workspace]
+# Version bumps are committed by the main-branch workflow, not by a release PR.
+changelog_update = false
+dependencies_update = false
+
+# Release only feature, bug-fix, performance, or explicitly breaking commits.
+# The final alternative also includes a BREAKING CHANGE footer in any commit type.
+release_commits = '^(?:(?:feat|fix|perf)(?:\([^)]*\))?!?:|[a-z]+(?:\([^)]*\))?!:)|BREAKING[- ]CHANGE'

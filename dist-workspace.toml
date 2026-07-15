@@ -1,0 +1,21 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = ["github"]
+# The installers to generate for each app
+installers = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Where to host releases
+hosting = "github"
+# The generated workflow is extended with a reusable caller and crates.io job.
+allow-dirty = ["ci"]
+# Where the Homebrew formula is published
+tap = "jwoo0122/homebrew-tap"
+# Publish the generated formula after the GitHub Release is hosted
+publish-jobs = ["homebrew"]

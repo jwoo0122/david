@@ -17,6 +17,23 @@ decisions:
     supersedes: []
     superseded_by: []
     last_reviewed: '2026-07-16'
+  - id: delivery.release-automation
+    status: accepted
+    scope: delivery
+    decision_type: pipeline
+    summary: Main pushes are converted into Conventional Commit-driven release commits,
+      and the resulting tag publishes the crate, binary artifacts, and Homebrew formula.
+    applies_to:
+      - version bump workflow
+      - GitHub Release workflow
+      - crates.io publication
+      - Homebrew formula publication
+    file: records/delivery/release-automation.md
+    constrains: []
+    depends_on: []
+    supersedes: []
+    superseded_by: []
+    last_reviewed: '2026-07-16'
   - id: runtime.agent-session
     status: accepted
     scope: runtime
