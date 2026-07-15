@@ -1219,6 +1219,63 @@ mod tests {
     }
 
     #[test]
+    fn run_supports_slashes_in_worktree_and_branch_names() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        let name = "feature/login";
+
+        app.run(repo.path(), name).unwrap();
+
+        let id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&id, name);
+        assert!(target.is_dir());
+        assert!(
+            Command::new("git")
+                .current_dir(repo.path())
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/feature/login"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        app.run(repo.path(), name).unwrap();
+        assert_eq!(sessions.state.borrow().created.len(), 1);
+        assert_eq!(sessions.state.borrow().attached.len(), 2);
+
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("feature/login\tfeature/login\ttest\t")
+        );
+
+        app.remove(repo.path(), name, true).unwrap();
+        assert!(!target.exists());
+        assert!(
+            !Command::new("git")
+                .current_dir(repo.path())
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/feature/login"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
     fn linked_worktrees_share_repository_identity() {
         let repo = init_repo();
         let home = tempfile::tempdir().unwrap();
