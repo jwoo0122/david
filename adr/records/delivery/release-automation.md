@@ -54,11 +54,11 @@ The project needs a single release source of truth while keeping the user-facing
 
 ## Consequences
 
-Every qualifying push can add a bot-authored commit to `main`. A failed package or tap publication can leave a GitHub Release partially complete and must be retried from the release workflow for the existing tag. The first `main` push after this pipeline is installed bootstraps `v1.0.0` even if the preceding development commits were not Conventional Commits.
+Every qualifying push can add a bot-authored commit to `main`. A failed package or tap publication can leave a GitHub Release partially complete. Crates.io publication can be retried with the manual `Publish crate` workflow for the existing release commit and version. The first `main` push after this pipeline is installed bootstraps `v1.0.0` even if the preceding development commits were not Conventional Commits.
 
 ## Enforcement
 
-CI configuration checks MUST verify the release-plz filter, initial `1.0.0` bootstrap, version-bump commit format, tag/ref handoff, secret names, target list, and Homebrew tap path. `dist plan --tag v1.0.0` MUST succeed locally. The ordinary Rust test, format, clippy, and locked release-build checks MUST remain green.
+CI configuration checks MUST verify the release-plz filter, initial `1.0.0` bootstrap, version-bump commit format, tag/ref handoff, secret names, target list, Homebrew tap path, and crate recovery workflow. `dist plan --tag v1.0.0` MUST succeed locally. The ordinary Rust test, format, clippy, and locked release-build checks MUST remain green.
 
 ## Revisit when
 

@@ -97,3 +97,5 @@ Homebrew users can install the prebuilt binary with:
 ```text
 brew install jwoo0122/tap/tony
 ```
+
+If a GitHub Release succeeds but crates.io publication fails, run the `Publish crate` workflow with the release commit SHA and version to retry only the crate publication.

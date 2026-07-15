@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2024"
 description = "Manage Git worktrees and attachable agent sessions"
 homepage = "https://github.com/jwoo0122/tony"
+license = "MIT"
 repository = "https://github.com/jwoo0122/tony"
 
 [dependencies]
