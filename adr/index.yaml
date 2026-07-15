@@ -1,0 +1,35 @@
+version: 1
+generated_by: maintain-architecture-decisions
+decisions:
+  - id: runtime.agent-session
+    status: accepted
+    scope: runtime
+    decision_type: integration
+    summary: Each managed worktree owns at most one persistent tmux agent session
+      that the CLI can attach to.
+    applies_to:
+      - configured agent launch
+      - tmux session creation and attach
+      - list and remove process state
+    file: records/runtime/agent-session.md
+    constrains: []
+    depends_on:
+      - worktree.storage-and-lifecycle
+    supersedes: []
+    superseded_by: []
+    last_reviewed: '2026-07-16'
+  - id: worktree.storage-and-lifecycle
+    status: accepted
+    scope: worktree
+    decision_type: boundary
+    summary: Managed worktrees live under a user-scoped hidden directory and are paired
+      with same-named branches for their full lifecycle.
+    applies_to:
+      - worktree creation and removal
+      - run and list commands
+    file: records/worktree/storage-and-lifecycle.md
+    constrains: []
+    depends_on: []
+    supersedes: []
+    superseded_by: []
+    last_reviewed: '2026-07-16'
