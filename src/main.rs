@@ -29,9 +29,22 @@ enum Command {
     },
     /// List managed worktrees and their active agent sessions.
     List,
-    /// Remove a worktree and terminate its managed agent session.
+    /// Remove a worktree, terminate its managed agent session, and delete its paired branch.
+    ///
+    /// Without `--force`, dirty worktrees are rejected. With it, uncommitted worktree changes
+    /// may be discarded. A clean worktree can be removed without it, even when the branch has
+    /// unmerged commits.
+    ///
+    /// Removal always terminates the session, removes the worktree, force-deletes the paired
+    /// local branch (`git branch -D -- <name>`), and removes david's session metadata, in that
+    /// order. Branch-only commits are intentionally lost. Branch deletion is always forced and
+    /// is not configurable.
+    ///
+    /// Both `david remove <name> --force` and `david remove --force <name>` are supported.
     Remove {
         name: String,
+        /// Discard uncommitted worktree changes; without it, dirty worktrees are rejected. It
+        /// does not control branch deletion.
         #[arg(long)]
         force: bool,
     },
@@ -71,6 +84,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn remove_cli_accepts_force_before_or_after_name() {
+        for arguments in [
+            ["david", "remove", "feature-login", "--force"],
+            ["david", "remove", "--force", "feature-login"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Remove {
+                    name,
+                    force: true
+                } if name == "feature-login"
+            ));
+        }
+    }
+
+    #[test]
+    fn remove_cli_help_describes_destructive_lifecycle_and_force_scope() {
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("remove")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "terminates the session",
+            "removes the worktree",
+            "git branch -D -- <name>",
+            "Branch-only commits are intentionally lost",
+            "Without `--force`, dirty worktrees are rejected",
+            "Discard uncommitted worktree changes; without it, dirty worktrees are rejected. It does not control branch deletion",
+            "Branch deletion is always forced",
+            "is not configurable",
+            "david remove <name> --force",
+            "david remove --force <name>",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
 
     #[test]
     fn prompt_cli_preserves_message_bytes_received_by_clap() {

@@ -88,14 +88,22 @@ david list
 
 While attached, the tmux status line shows the `DAVID` marker, project/worktree/agent names, and the detach shortcut. Detach without stopping the agent with `Ctrl-]`. The standard `Ctrl-b`, then `d`, sequence remains available as a fallback.
 
-Remove a clean worktree, its agent session, and its paired branch:
+Remove a clean worktree, terminate its agent session, and delete its paired local branch:
 
 ```text
 david remove feature-login
 ```
 
-Use `--force` only when the worktree's uncommitted changes should be discarded:
+Removal always terminates the agent session, removes the worktree, force-deletes the paired
+branch with `git branch -D -- <name>`, and then removes david's session metadata. The branch
+deletion is always forced and is not configurable: commits reachable only from that branch are
+intentionally lost, including unmerged branch-only commits.
+
+Without `--force`, removal rejects a worktree with uncommitted changes. With it, those changes
+may be discarded; it is not needed for a clean worktree, even when its branch is unmerged. Use
+either argument order:
 
 ```text
 david remove feature-login --force
+david remove --force feature-login
 ```
