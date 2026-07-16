@@ -32,6 +32,8 @@ Managed tmux sessions MUST use the `david-<repo-id>-<stable-worktree-hash>` nami
 
 `list` MUST report only sessions created and tracked by this CLI. Removing a worktree MUST terminate its managed tmux session before removing the checkout.
 
+A managed session MUST provide a session-scoped `Ctrl-]` shortcut that detaches the client without stopping the agent. The shortcut MUST NOT replace root or prefix bindings for unrelated tmux sessions. The standard `Ctrl-b d` tmux sequence MUST remain available as a fallback. While attached, the tmux status line MUST identify the session as `DAVID` and show the project directory name, worktree name, configured agent name, and the detach shortcut.
+
 ## Context and forces
 
 A directly exec'd child process is tied to the invoking terminal and cannot provide a later interactive attach point. tmux supplies a persistent pseudo-terminal without modifying the agent command or adding a custom agent UI. It is an explicit runtime dependency for the first macOS/Linux implementation.
@@ -53,11 +55,11 @@ A directly exec'd child process is tied to the invoking terminal and cannot prov
 
 ## Consequences
 
-Users can detach with tmux's standard `Ctrl-b d` sequence and later reattach through `run`. The CLI must manage session naming, stale state, and forced termination. tmux installation is required on supported systems.
+Users can detach with the direct `Ctrl-]` shortcut or tmux's standard `Ctrl-b d` sequence and later reattach through `run`. The status line makes the managed-session context and detach action visible without changing the agent command. The CLI must manage session naming, stale state, and forced termination. tmux installation is required on supported systems.
 
 ## Enforcement
 
-Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, stale-session handling, list output, tmux prerequisite failure, and removal ordering.
+Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, stale-session handling, list output, tmux prerequisite failure, removal ordering, and the managed-session status line and detach binding.
 
 ## Revisit when
 
