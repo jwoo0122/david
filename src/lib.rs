@@ -28,16 +28,16 @@ pub enum ToolError {
 }
 
 #[derive(Clone, Debug)]
-pub struct TonyPaths {
+pub struct DavidPaths {
     worktrees: PathBuf,
     sessions: PathBuf,
     config: PathBuf,
 }
 
-impl TonyPaths {
+impl DavidPaths {
     pub fn from_home(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
-        let root = home.join(".tony");
+        let root = home.join(".david");
         Self {
             worktrees: root.join("worktrees"),
             sessions: root.join("sessions"),
@@ -573,20 +573,20 @@ impl SessionBackend for TmuxBackend {
 }
 
 pub struct App<S, P = TerminalAgentPicker> {
-    paths: TonyPaths,
+    paths: DavidPaths,
     git: Git,
     sessions: S,
     picker: P,
 }
 
 impl<S: SessionBackend> App<S, TerminalAgentPicker> {
-    pub fn new(paths: TonyPaths, sessions: S) -> Self {
+    pub fn new(paths: DavidPaths, sessions: S) -> Self {
         Self::with_picker(paths, sessions, TerminalAgentPicker)
     }
 }
 
 impl<S: SessionBackend, P: AgentPicker> App<S, P> {
-    pub fn with_picker(paths: TonyPaths, sessions: S, picker: P) -> Self {
+    pub fn with_picker(paths: DavidPaths, sessions: S, picker: P) -> Self {
         Self {
             paths,
             git: Git::default(),
@@ -637,7 +637,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 read_session_state(&state_path)?
             } else {
                 return Err(ToolError::Message(format!(
-                    "tmux session {session} exists but is not managed by tony"
+                    "tmux session {session} exists but is not managed by david"
                 )));
             };
             if !state.matches(&repo_id, name, &target, &session) {
@@ -780,7 +780,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             }
         } else if live {
             return Err(ToolError::Message(format!(
-                "tmux session {session} exists but is not managed by tony"
+                "tmux session {session} exists but is not managed by david"
             )));
         }
         if live {
@@ -863,7 +863,7 @@ pub fn stable_hash(value: &str) -> String {
 }
 
 fn session_name(repo_id: &str, worktree_name: &str) -> String {
-    format!("tony-{repo_id}-{}", stable_hash(worktree_name))
+    format!("david-{repo_id}-{}", stable_hash(worktree_name))
 }
 
 fn write_config(path: &Path, config: &Config) -> Result<()> {
@@ -1043,7 +1043,7 @@ mod tests {
         }
     }
 
-    fn test_app(paths: TonyPaths, sessions: FakeSessions) -> App<FakeSessions, FirstAgentPicker> {
+    fn test_app(paths: DavidPaths, sessions: FakeSessions) -> App<FakeSessions, FirstAgentPicker> {
         App::with_picker(paths, sessions, FirstAgentPicker)
     }
 
@@ -1091,8 +1091,8 @@ mod tests {
         assert!(status.success(), "git command failed: {args:?}");
     }
 
-    fn configured_paths(home: &Path) -> TonyPaths {
-        let paths = TonyPaths::from_home(home);
+    fn configured_paths(home: &Path) -> DavidPaths {
+        let paths = DavidPaths::from_home(home);
         fs::create_dir_all(paths.config_path().parent().unwrap()).unwrap();
         fs::write(
             paths.config_path(),
@@ -1114,6 +1114,20 @@ mod tests {
             repository_id(first.path()).unwrap(),
             repository_id(second.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn uses_david_storage_namespace() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = DavidPaths::from_home(home.path());
+        let expected = home.path().join(".david/config.toml");
+
+        assert_eq!(paths.config_path(), expected.as_path());
+    }
+
+    #[test]
+    fn names_sessions_in_david_namespace() {
+        assert!(session_name("repo", "worktree").starts_with("david-"));
     }
 
     #[test]
@@ -1144,7 +1158,7 @@ mod tests {
     #[test]
     fn setup_merges_agents_and_scaffolds_config() {
         let home = tempfile::tempdir().unwrap();
-        let paths = TonyPaths::from_home(home.path());
+        let paths = DavidPaths::from_home(home.path());
         fs::create_dir_all(paths.config_path().parent().unwrap()).unwrap();
         fs::write(
             paths.config_path(),
@@ -1187,7 +1201,7 @@ mod tests {
     #[test]
     fn setup_rejects_empty_result_without_writing_config() {
         let home = tempfile::tempdir().unwrap();
-        let paths = TonyPaths::from_home(home.path());
+        let paths = DavidPaths::from_home(home.path());
 
         let error = paths.setup_with(EmptySetup).unwrap_err();
 
@@ -1354,7 +1368,7 @@ mod tests {
             return;
         }
 
-        let session = format!("tony-test-{}-{}", std::process::id(), stable_hash("tmux"));
+        let session = format!("david-test-{}-{}", std::process::id(), stable_hash("tmux"));
         let directory = tempfile::tempdir().unwrap();
         let backend = TmuxBackend::default();
         let agent = Agent {

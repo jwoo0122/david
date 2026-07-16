@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
 
           release=false
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tony") | .version')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "david") | .version')"
 
           if ! git tag --list 'v*' | grep -q .; then
             if [[ "$version" != "1.0.0" ]]; then
@@ -55,7 +55,7 @@ jobs:
             git add Cargo.toml Cargo.lock
             if ! git diff --cached --quiet; then
               release=true
-              version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tony") | .version')"
+              version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "david") | .version')"
             fi
           fi
 

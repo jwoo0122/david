@@ -38,14 +38,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tony") | .version')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "david") | .version')"
           if [[ "$version" != "${{ inputs.version }}" ]]; then
-            echo "expected tony ${{ inputs.version }}, found ${version}" >&2
+            echo "expected david ${{ inputs.version }}, found ${version}" >&2
             exit 1
           fi
 
-          if cargo info --registry crates-io "tony@${version}" >/dev/null 2>&1; then
-            echo "tony ${version} is already published"
+          if cargo info --registry crates-io "david@${version}" >/dev/null 2>&1; then
+            echo "david ${version} is already published"
           else
             cargo publish --locked
           fi

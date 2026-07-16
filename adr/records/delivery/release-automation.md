@@ -28,7 +28,7 @@ The project MUST use `1.0.0` as its initial package version. A workflow triggere
 
 When a release is needed, the workflow MUST commit the resulting manifest version as `chore(release): v<version>` and create the matching `v<version>` tag. The release commit MUST be the source revision for the release.
 
-The release pipeline MUST use cargo-dist to build macOS Apple Silicon, macOS Intel, and x86_64 Linux artifacts, create the GitHub Release, and publish the generated `Formula/tony.rb` to `jwoo0122/homebrew-tap`. A separate release job MUST publish the same package version to crates.io using the `CARGO_TOKEN` repository secret. The Homebrew publishing job MUST use the `HOMEBREW_TAP_TOKEN` repository secret and MUST not store either secret in the repository.
+The release pipeline MUST use cargo-dist to build macOS Apple Silicon, macOS Intel, and x86_64 Linux artifacts, create the GitHub Release, and publish the generated `Formula/david.rb` to `jwoo0122/homebrew-tap`. A separate release job MUST publish the same package version for the `david` package to crates.io using the `CARGO_TOKEN` repository secret. The Homebrew publishing job MUST use the `HOMEBREW_TAP_TOKEN` repository secret and MUST not store either secret in the repository.
 
 The release workflow MUST be reusable by the version-bump workflow. This avoids depending on a second workflow event after a commit or tag written with the default `GITHUB_TOKEN`.
 
@@ -43,7 +43,8 @@ The project needs a single release source of truth while keeping the user-facing
 - The version-bump workflow MUST not recursively create release commits.
 - Release artifacts MUST come from the tagged release commit.
 - Homebrew MUST install prebuilt artifacts and MUST not require Rust at installation time.
-- The formula MUST be written only to `jwoo0122/homebrew-tap` at `Formula/tony.rb`.
+- The formula MUST be written only to `jwoo0122/homebrew-tap` at `Formula/david.rb`.
+- The public Cargo package and Homebrew formula identity MUST be `david`; previously published `tony` artifacts remain historical and are not silently republished under the new name.
 - The workflow MUST fail closed when its required repository secrets are unavailable; no fallback token or checked-in credential is allowed.
 
 ## Alternatives and trade-offs
@@ -54,11 +55,11 @@ The project needs a single release source of truth while keeping the user-facing
 
 ## Consequences
 
-Every qualifying push can add a bot-authored commit to `main`. A failed package or tap publication can leave a GitHub Release partially complete. Crates.io publication can be retried with the manual `Publish crate` workflow for the existing release commit and version. The first `main` push after this pipeline is installed bootstraps `v1.0.0` even if the preceding development commits were not Conventional Commits.
+Every qualifying push can add a bot-authored commit to `main`. A failed package or tap publication can leave a GitHub Release partially complete. Crates.io publication can be retried with the manual `Publish crate` workflow for the existing release commit and version. The first `main` push after this pipeline is installed bootstraps `v1.0.0` even if the preceding development commits were not Conventional Commits. Existing `tony` installations are not upgraded by the new package name and remain on their historical package and formula identities.
 
 ## Enforcement
 
-CI configuration checks MUST verify the release-plz filter, initial `1.0.0` bootstrap, version-bump commit format, tag/ref handoff, secret names, target list, Homebrew tap path, and crate recovery workflow. `dist plan --tag v1.0.0` MUST succeed locally. The ordinary Rust test, format, clippy, and locked release-build checks MUST remain green.
+CI configuration checks MUST verify the release-plz filter, initial `1.0.0` bootstrap, `david` package identity, version-bump commit format, tag/ref handoff, secret names, target list, Homebrew tap path, and crate recovery workflow. `dist plan --tag v1.0.0` MUST succeed locally. The ordinary Rust test, format, clippy, and locked release-build checks MUST remain green.
 
 ## Revisit when
 

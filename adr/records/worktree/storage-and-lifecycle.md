@@ -22,7 +22,7 @@ Where does the CLI store managed worktrees, and what lifecycle does a named work
 
 ## Current decision
 
-The CLI MUST store managed worktree checkouts below `~/.tony/worktrees/<repo-id>/<worktree-name>`. The repository identity MUST include a stable identifier derived from the canonical Git common directory so linked worktrees of one repository share an identity while separate clones cannot collide.
+The CLI MUST store managed worktree checkouts below `~/.david/worktrees/<repo-id>/<worktree-name>`. The repository identity MUST include a stable identifier derived from the canonical Git common directory so linked worktrees of one repository share an identity while separate clones cannot collide.
 
 `run <worktree-name>` MUST create the named worktree from the current `HEAD` on a new branch with the same name when it does not exist, and MUST reuse it when it does exist. The source repository MUST be clean before creation. `remove <worktree-name>` MUST refuse a dirty worktree unless `--force` is supplied, then MUST delete the paired branch after removing the worktree. A later `run` with the same name therefore creates a fresh branch from the then-current `HEAD`.
 
@@ -34,7 +34,7 @@ The command is intentionally unified so callers do not need to distinguish creat
 
 ## Invariants
 
-- Managed checkout paths MUST remain below the configured user-scoped `.tony/worktrees` directory.
+- Managed checkout paths MUST remain below the configured user-scoped `.david/worktrees` directory.
 - Repository identity MUST distinguish canonical Git common directories with the same basename.
 - Invocations from linked worktrees MUST resolve to the same repository identity as invocations from the main worktree.
 - Creation MUST use the current `HEAD` and a new branch named for the worktree.
@@ -54,7 +54,7 @@ The command is intentionally unified so callers do not need to distinguish creat
 
 ## Consequences
 
-The CLI owns a predictable user-level storage tree and can find managed state without adding files to the source repository. Users must use the CLI's removal flow to clean managed worktrees. Removing a clean worktree also removes its branch and any commits reachable only from that branch, so removal is intentionally destructive at the branch level. The path includes an opaque identifier, which is less readable than a basename-only layout but avoids collisions.
+The CLI owns a predictable user-level storage tree and can find managed state without adding files to the source repository. Users must use the CLI's removal flow to clean managed worktrees. Removing a clean worktree also removes its branch and any commits reachable only from that branch, so removal is intentionally destructive at the branch level. The path includes an opaque identifier, which is less readable than a basename-only layout but avoids collisions. The rebrand is a hard cutover: existing `~/.tony` state must be migrated to `~/.david` before using the `david` binary, and the runtime does not retain the old storage root as a supported namespace.
 
 ## Enforcement
 

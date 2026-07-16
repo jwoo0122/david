@@ -28,6 +28,8 @@ The CLI MUST launch each configured agent inside a dedicated tmux session for it
 
 `run <worktree-name>` MUST attach to an existing managed session without showing the agent picker. If the worktree has no live managed session, `run` MUST show the configured agent list, start the selected agent in a new session, and attach to it. A worktree MUST have at most one managed agent session.
 
+Managed tmux sessions MUST use the `david-<repo-id>-<stable-worktree-hash>` naming prefix so the CLI owns a distinct namespace.
+
 `list` MUST report only sessions created and tracked by this CLI. Removing a worktree MUST terminate its managed tmux session before removing the checkout.
 
 ## Context and forces
