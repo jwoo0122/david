@@ -72,6 +72,14 @@ If a live agent session already exists, `david run` attaches to it. Otherwise it
 
 Move focus with the up/down arrow keys and press `Enter` to select an agent.
 
+Send a prompt to an existing live managed agent session:
+
+```text
+david prompt feature-login "Review the failing tests"
+```
+
+The single `message` argument is delivered exactly as received, including spaces, quotes, shell metacharacters, Unicode, and multiline content, then submitted. Quote or escape it for your shell; shell parsing happens before `david` receives it. Use `--` before a message that is itself a CLI option, for example `david prompt feature-login -- --help`. `david prompt` does not attach to, start, or select an agent. It fails if `<worktree>` is not an existing managed worktree on its expected branch, if the corresponding session is missing, stopped, unmanaged, or has mismatched metadata, or if tmux is unavailable or cannot deliver the prompt.
+
 List managed worktrees and agents:
 
 ```text
