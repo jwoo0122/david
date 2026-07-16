@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use david::{App, DavidPaths, Result, TmuxBackend};
-use std::{env, io};
+use david::{App, DavidPaths, Result, RunOptions, TmuxBackend};
+use std::{env, io, io::IsTerminal};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -18,7 +18,24 @@ enum Command {
     /// Create or update the user-scoped agent configuration.
     Setup,
     /// Create or reuse a worktree and attach to its agent session.
-    Run { name: String },
+    Run {
+        /// Name of the managed worktree.
+        name: String,
+        /// Select a configured agent without opening the picker.
+        #[arg(short = 'a', long)]
+        agent: Option<String>,
+        /// Create or reuse the session without attaching to it.
+        #[arg(short = 'd', long)]
+        detach: bool,
+        /// Prohibit all interactive selection and terminal attachment.
+        #[arg(long)]
+        no_interactive: bool,
+        /// Arguments appended to the configured agent command.
+        #[arg(last = true, allow_hyphen_values = true)]
+        agent_args: Vec<String>,
+    },
+    /// Attach to an existing managed agent session.
+    Attach { name: String },
     /// Deliver a prompt to an existing managed agent session.
     Prompt {
         /// Name of the existing managed worktree.
@@ -37,6 +54,14 @@ enum Command {
     },
 }
 
+fn terminal_interaction_allowed(
+    no_interactive: bool,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    !no_interactive && stdin_is_terminal && stderr_is_terminal
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = DavidPaths::from_env()?;
@@ -47,7 +72,30 @@ fn run() -> Result<()> {
             let cwd = env::current_dir()?;
             let app = App::new(paths, TmuxBackend::default());
             match command {
-                Command::Run { name } => app.run(&cwd, &name),
+                Command::Run {
+                    name,
+                    agent,
+                    detach,
+                    no_interactive,
+                    agent_args,
+                } => {
+                    let interactive = terminal_interaction_allowed(
+                        no_interactive,
+                        io::stdin().is_terminal(),
+                        io::stderr().is_terminal(),
+                    );
+                    app.run_with_options(
+                        &cwd,
+                        &name,
+                        RunOptions {
+                            agent,
+                            agent_args,
+                            interactive,
+                            attach: !detach && interactive,
+                        },
+                    )
+                }
+                Command::Attach { name } => app.attach(&cwd, &name),
                 Command::Prompt { worktree, message } => app.prompt(&cwd, &worktree, &message),
                 Command::List => {
                     let stdout = io::stdout();
@@ -64,13 +112,61 @@ fn run() -> Result<()> {
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
-        std::process::exit(1);
+        std::process::exit(error.exit_code());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_cli_preserves_runtime_argument_boundaries() {
+        let cli = Cli::try_parse_from([
+            "david",
+            "run",
+            "-a",
+            "codex",
+            "-d",
+            "feature-login",
+            "--",
+            "--model",
+            "gpt 5.6",
+            "$()",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Run {
+                name,
+                agent,
+                detach,
+                no_interactive,
+                agent_args,
+            } => {
+                assert_eq!(name, "feature-login");
+                assert_eq!(agent.as_deref(), Some("codex"));
+                assert!(detach);
+                assert!(!no_interactive);
+                assert_eq!(agent_args, ["--model", "gpt 5.6", "$()"]);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn noninteractive_or_nonterminal_input_disables_interaction() {
+        assert!(terminal_interaction_allowed(false, true, true));
+        assert!(!terminal_interaction_allowed(true, true, true));
+        assert!(!terminal_interaction_allowed(false, false, true));
+        assert!(!terminal_interaction_allowed(false, true, false));
+    }
+
+    #[test]
+    fn attach_cli_parses_the_worktree_name() {
+        let cli = Cli::try_parse_from(["david", "attach", "feature-login"]).unwrap();
+        assert!(matches!(cli.command, Command::Attach { name } if name == "feature-login"));
+    }
 
     #[test]
     fn prompt_cli_preserves_message_bytes_received_by_clap() {
