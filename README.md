@@ -115,6 +115,38 @@ List managed worktrees and agents:
 david list
 ```
 
+The default table is intended for human use. For automation, use porcelain output:
+
+```text
+david list --porcelain
+# Add -z for NUL-terminated fields and records.
+david list --porcelain -z
+```
+
+Each porcelain record contains these fields in this order:
+
+```text
+name <task-name>
+branch <branch-or-(detached)>
+agent <running-agent-or->
+session <active|inactive|unknown>
+path <absolute-worktree-path>
+```
+
+LF output terminates fields and records are separated by one additional LF. NUL output terminates fields and uses one additional NUL only between records; embedded newlines in values are preserved. An empty porcelain list writes zero bytes.
+
+Print one managed worktree path without starting or querying tmux:
+
+```text
+david path feature-login
+# Add -0 for one NUL terminator.
+david path -0 feature-login
+```
+
+`david path` requires an existing managed worktree on its same-named branch and writes only its absolute path plus the selected terminator.
+
+Exit statuses are `0` for successful commands, `1` for Git/tmux/filesystem and other runtime errors, and `2` for malformed command lines rejected by Clap. In particular, `david list -z` is rejected; `-z` is valid only with `--porcelain`.
+
 While attached, the tmux status line shows the `DAVID` marker, project/worktree/agent names, and the detach shortcut. Detach without stopping the agent with `Ctrl-]`. The standard `Ctrl-b`, then `d`, sequence remains available as a fallback.
 
 Remove a clean worktree, its agent session, and its paired branch:
