@@ -1,5 +1,5 @@
 [package]
-name = "tony"
+name = "david"
 version = "1.0.0"
 edition = "2024"
 description = "Manage Git worktrees and attachable agent sessions"

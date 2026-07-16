@@ -383,9 +383,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tony") | .version')"
-          if cargo info --registry crates-io "tony@${version}" >/dev/null 2>&1; then
-            echo "tony ${version} is already published"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "david") | .version')"
+          if cargo info --registry crates-io "david@${version}" >/dev/null 2>&1; then
+            echo "david ${version} is already published"
           else
             cargo publish --locked
           fi

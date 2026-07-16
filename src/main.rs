@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
+use david::{App, DavidPaths, Result, TmuxBackend};
 use std::{env, io};
-use tony::{App, Result, TmuxBackend, TonyPaths};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "tony",
+    name = "david",
     version,
     about = "Manage Git worktrees and agent sessions"
 )]
@@ -31,7 +31,7 @@ enum Command {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let paths = TonyPaths::from_env()?;
+    let paths = DavidPaths::from_env()?;
 
     match cli.command {
         Command::Setup => paths.setup(),
