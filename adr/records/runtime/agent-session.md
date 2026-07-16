@@ -39,6 +39,8 @@ During an in-progress rebase, Git may report a managed worktree as detached. Rea
 
 A managed session MUST provide a session-scoped `Ctrl-]` shortcut that detaches the client without stopping the agent. The shortcut MUST NOT replace root or prefix bindings for unrelated tmux sessions. The standard `Ctrl-b d` tmux sequence MUST remain available as a fallback. While attached, the tmux status line MUST identify the session as `DAVID` and show the project directory name, worktree name, configured agent name, and the detach shortcut.
 
+David MUST keep managed tmux configuration deterministic instead of loading arbitrary user tmux configuration. It MUST enable `mouse` for each managed session and `extended-keys` for the tmux server when configuring a managed session, both when creating and reusing it. These interaction options require tmux 3.2 or newer. `extended-keys` is server-scoped by tmux and therefore can affect other sessions sharing that server; use of a separate server is required if that side effect becomes unacceptable.
+
 ## Context and forces
 
 A directly exec'd child process is tied to the invoking terminal and cannot provide a later interactive attach point. tmux supplies a persistent pseudo-terminal without modifying the agent command or adding a custom agent UI. It is an explicit runtime dependency for the first macOS/Linux implementation.
@@ -58,6 +60,8 @@ A directly exec'd child process is tied to the invoking terminal and cannot prov
 - A detached worktree MUST only be accepted for reattachment when recognized in-progress rebase metadata names the expected branch and the managed session is already live.
 - Prompt delivery MUST preserve UTF-8 and line feeds, use literal paste semantics, and submit only after the complete message has been pasted.
 - Prompt delivery MUST use an exact session/pane target and MUST not pass the message through a shell or tmux key-name parser.
+- Managed tmux commands MUST use the CLI's configuration-isolation behavior rather than sourcing the user's tmux configuration.
+- Managed sessions MUST have mouse capture enabled, and the server MUST have extended-key reporting enabled before the agent is attached.
 - New session metadata MUST retain the created agent pane identity so later prompts do not depend on the caller's current pane.
 - Dead agent panes MUST not receive prompts or be reported as active agents.
 - Stale session metadata MUST never be reported as an active agent.
@@ -76,7 +80,7 @@ Users can detach with the direct `Ctrl-]` shortcut or tmux's standard `Ctrl-b d`
 
 ## Enforcement
 
-Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, deterministic agent precedence, unknown-agent and missing-selection failures, non-terminal and detach behavior, literal runtime argv, explicit attach without creation or restart, prompt delivery without attach or picker interaction, literal Unicode and multiline prompt content, missing/dead session handling, stale-session handling, tmux ownership metadata mismatch, rebase-detached reattachment, arbitrary-detached and wrong-branch rejection, list output, tmux prerequisite failure, removal ordering, serialized lifecycle operations, and the managed-session status line and detach binding.
+Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, deterministic agent precedence, unknown-agent and missing-selection failures, non-terminal and detach behavior, literal runtime argv, explicit attach without creation or restart, prompt delivery without attach or picker interaction, literal Unicode and multiline prompt content, missing/dead session handling, stale-session handling, tmux ownership metadata mismatch, rebase-detached reattachment, arbitrary-detached and wrong-branch rejection, list output, tmux prerequisite failure, removal ordering, serialized lifecycle operations, the managed-session status line and detach binding, and the managed mouse and extended-key options.
 
 ## Revisit when
 

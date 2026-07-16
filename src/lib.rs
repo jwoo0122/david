@@ -730,6 +730,9 @@ pub trait SessionBackend {
     fn pane_is_alive(&self, _name: &str, _pane: &str) -> Result<bool> {
         Ok(true)
     }
+    fn configure_session_options(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
+        Ok(())
+    }
     fn configure_session(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
         Ok(())
     }
@@ -812,8 +815,7 @@ impl TmuxBackend {
         )))
     }
 
-    fn set_option(&self, session: &str, option: &str, value: &str) -> Result<()> {
-        let target = self.session_id(session)?;
+    fn set_option_at(&self, target: &str, option: &str, value: &str) -> Result<()> {
         let mut command = self.command();
         command
             .args(["set-option", "-t"])
@@ -822,8 +824,18 @@ impl TmuxBackend {
         self.run_command(command)
     }
 
-    fn show_option(&self, session: &str, option: &str) -> Result<String> {
+    fn set_option(&self, session: &str, option: &str, value: &str) -> Result<()> {
         let target = self.session_id(session)?;
+        self.set_option_at(&target, option, value)
+    }
+
+    fn set_server_option(&self, option: &str, value: &str) -> Result<()> {
+        let mut command = self.command();
+        command.args(["set-option", "-s", option, value]);
+        self.run_command(command)
+    }
+
+    fn show_option_at(&self, target: &str, option: &str) -> Result<String> {
         let mut command = self.command();
         command
             .args(["show-option", "-v", "-t"])
@@ -833,8 +845,12 @@ impl TmuxBackend {
         Ok(text(&output.stdout).trim().to_owned())
     }
 
-    fn show_option_exact(&self, session: &str, option: &str) -> Result<String> {
+    fn show_option(&self, session: &str, option: &str) -> Result<String> {
         let target = self.session_id(session)?;
+        self.show_option_at(&target, option)
+    }
+
+    fn show_option_exact_at(&self, target: &str, option: &str) -> Result<String> {
         let mut command = self.command();
         command
             .args(["show-option", "-v", "-t"])
@@ -846,12 +862,31 @@ impl TmuxBackend {
             .to_owned())
     }
 
-    fn session_metadata(&self, session: &str) -> Result<SessionMetadata> {
+    fn session_metadata_at(&self, target: &str) -> Result<SessionMetadata> {
         Ok(SessionMetadata {
-            project_name: self.show_option_exact(session, "@david-project")?,
-            worktree_name: self.show_option_exact(session, "@david-worktree")?,
-            agent_name: self.show_option_exact(session, "@david-agent")?,
+            project_name: self.show_option_exact_at(target, "@david-project")?,
+            worktree_name: self.show_option_exact_at(target, "@david-worktree")?,
+            agent_name: self.show_option_exact_at(target, "@david-agent")?,
         })
+    }
+
+    fn validate_session_metadata_at(
+        &self,
+        session: &str,
+        target: &str,
+        expected: &SessionMetadata,
+    ) -> Result<()> {
+        let actual = self.session_metadata_at(target).map_err(|error| {
+            ToolError::Message(format!(
+                "tmux session {session} is missing david ownership metadata: {error}"
+            ))
+        })?;
+        if actual != *expected {
+            return Err(ToolError::Message(format!(
+                "tmux session {session} metadata does not match the requested worktree"
+            )));
+        }
+        Ok(())
     }
 
     fn configure_key_table(&self, session: &str) -> Result<()> {
@@ -1122,6 +1157,17 @@ impl TmuxBackend {
             Err(command_error("tmux", &output))
         }
     }
+
+    fn has_server(&self) -> Result<bool> {
+        let output = self.command().arg("list-sessions").output()?;
+        if output.status.success() {
+            Ok(true)
+        } else if output.status.code() == Some(1) && tmux_server_is_absent(&text(&output.stderr)) {
+            Ok(false)
+        } else {
+            Err(command_error("tmux", &output))
+        }
+    }
 }
 
 impl SessionBackend for TmuxBackend {
@@ -1136,6 +1182,32 @@ impl SessionBackend for TmuxBackend {
             }
         })?;
         if output.status.success() {
+            let version = text(&output.stdout);
+            let version = version.trim();
+            if !supports_extended_keys(version) {
+                return Err(ToolError::Message(format!(
+                    "tmux 3.2 or newer is required for managed extended keys; found {version}"
+                )));
+            }
+            if self.has_server()? {
+                let mut command = self.command();
+                command.args(["show-options", "-s", "extended-keys"]);
+                let output = command.output()?;
+                if !output.status.success() {
+                    return Err(ToolError::Message(format!(
+                        "tmux server does not support extended keys: {}",
+                        command_error("tmux", &output)
+                    )));
+                }
+                if !text(&output.stdout)
+                    .lines()
+                    .any(|line| line.starts_with("extended-keys "))
+                {
+                    return Err(ToolError::Message(
+                        "tmux server did not report the extended-keys option".to_owned(),
+                    ));
+                }
+            }
             Ok(())
         } else {
             Err(command_error("tmux", &output))
@@ -1223,10 +1295,18 @@ impl SessionBackend for TmuxBackend {
         }
     }
 
+    fn configure_session_options(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+        let target = self.session_id(name)?;
+        self.validate_session_metadata_at(name, &target, metadata)?;
+        self.set_option_at(&target, "mouse", "on")?;
+        self.set_server_option("extended-keys", "on")
+    }
+
     fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
         self.set_option(name, "@david-project", &metadata.project_name)?;
         self.set_option(name, "@david-worktree", &metadata.worktree_name)?;
         self.set_option(name, "@david-agent", &metadata.agent_name)?;
+        self.configure_session_options(name, metadata)?;
         self.configure_key_table(name)?;
         self.set_option(name, "status", "on")?;
         self.set_option(
@@ -1240,17 +1320,8 @@ impl SessionBackend for TmuxBackend {
     }
 
     fn validate_session_metadata(&self, name: &str, expected: &SessionMetadata) -> Result<()> {
-        let actual = self.session_metadata(name).map_err(|error| {
-            ToolError::Message(format!(
-                "tmux session {name} is missing david ownership metadata: {error}"
-            ))
-        })?;
-        if actual != *expected {
-            return Err(ToolError::Message(format!(
-                "tmux session {name} metadata does not match the requested worktree"
-            )));
-        }
-        Ok(())
+        let target = self.session_id(name)?;
+        self.validate_session_metadata_at(name, &target, expected)
     }
 
     fn attach(&self, name: &str) -> Result<()> {
@@ -1374,12 +1445,16 @@ impl SessionBackend for TmuxBackend {
     }
 
     fn clear_session_affordances(&self, name: &str) -> Result<()> {
-        self.clear_key_tables(name)
+        if self.has_server()? {
+            self.clear_key_tables(name)
+        } else {
+            Ok(())
+        }
     }
 
     fn kill_session(&self, name: &str) -> Result<()> {
         if !self.has_session(name)? {
-            return self.clear_key_tables(name);
+            return self.clear_session_affordances(name);
         }
         let target = self.session_id(name)?;
         let mut command = self.command();
@@ -1390,7 +1465,7 @@ impl SessionBackend for TmuxBackend {
                 "tmux session {name} is still running after termination"
             )));
         }
-        self.clear_key_tables(name)
+        self.clear_session_affordances(name)
     }
 }
 
@@ -1512,6 +1587,8 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 &state_path,
                 &project_name,
             )?;
+            self.sessions
+                .configure_session_options(&session, &metadata)?;
             return if options.attach && options.interactive {
                 drop(_lock);
                 self.sessions.attach(&session)
@@ -2418,6 +2495,25 @@ fn command_available(command: &str) -> bool {
     env::split_paths(&path).any(|directory| directory.join(command).is_file())
 }
 
+fn supports_extended_keys(version: &str) -> bool {
+    let mut numbers = version
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|component| component.parse::<u32>().ok());
+    let Some(major) = numbers.next() else {
+        return false;
+    };
+    let Some(minor) = numbers.next() else {
+        return false;
+    };
+    major > 3 || major == 3 && minor >= 2
+}
+
+fn tmux_server_is_absent(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("no server running")
+        || (detail.contains("error connecting") && detail.contains("no such file or directory"))
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -2457,6 +2553,7 @@ mod tests {
         created: Vec<String>,
         created_agents: Vec<Agent>,
         configured: Vec<(String, SessionMetadata)>,
+        configured_options: Vec<String>,
         metadata: BTreeMap<String, SessionMetadata>,
         attached: Vec<String>,
         killed: Vec<String>,
@@ -2484,12 +2581,22 @@ mod tests {
         }
 
         fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
-            let mut state = self.state.borrow_mut();
-            if let Some(message) = &state.configure_error {
-                return Err(ToolError::Message(message.clone()));
+            {
+                let mut state = self.state.borrow_mut();
+                if let Some(message) = &state.configure_error {
+                    return Err(ToolError::Message(message.clone()));
+                }
+                state.configured.push((name.to_owned(), metadata.clone()));
+                state.metadata.insert(name.to_owned(), metadata.clone());
             }
-            state.configured.push((name.to_owned(), metadata.clone()));
-            state.metadata.insert(name.to_owned(), metadata.clone());
+            self.configure_session_options(name, metadata)
+        }
+
+        fn configure_session_options(&self, name: &str, _metadata: &SessionMetadata) -> Result<()> {
+            self.state
+                .borrow_mut()
+                .configured_options
+                .push(name.to_owned());
             Ok(())
         }
 
@@ -3037,12 +3144,20 @@ mod tests {
         assert!(target.is_dir());
         assert_eq!(sessions.state.borrow().created.len(), 1);
         assert_eq!(sessions.state.borrow().configured.len(), 1);
+        assert_eq!(
+            sessions.state.borrow().configured_options,
+            vec![session_name(&id, "feature")]
+        );
         assert_eq!(sessions.state.borrow().configured[0].1, expected);
         assert_eq!(sessions.state.borrow().attached.len(), 1);
 
         app.run(repo.path(), "feature").unwrap();
         assert_eq!(sessions.state.borrow().created.len(), 1);
         assert_eq!(sessions.state.borrow().configured.len(), 1);
+        assert_eq!(
+            sessions.state.borrow().configured_options,
+            vec![session_name(&id, "feature"), session_name(&id, "feature")]
+        );
         assert_eq!(sessions.state.borrow().configured[0].1, expected);
         assert_eq!(sessions.state.borrow().attached.len(), 2);
     }
@@ -3061,6 +3176,7 @@ mod tests {
         app.run(repo.path(), "feature").unwrap();
 
         assert_eq!(sessions.state.borrow().configured.len(), 1);
+        assert_eq!(sessions.state.borrow().configured_options.len(), 2);
         assert_eq!(sessions.state.borrow().attached.len(), 2);
     }
 
@@ -3685,22 +3801,105 @@ mod tests {
         assert!(output.contains("feature\tfeature\ttest\t"));
     }
 
-    #[test]
-    fn tmux_backend_configures_managed_session_affordances_when_tmux_is_available() {
-        let Ok(available) = Command::new("tmux").arg("-V").output() else {
-            return;
-        };
-        if !available.status.success() {
-            return;
+    #[cfg(unix)]
+    struct TmuxTestServer {
+        directory: TempDir,
+        wrapper: PathBuf,
+        sentinel: String,
+    }
+
+    #[cfg(unix)]
+    impl TmuxTestServer {
+        fn new(label: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempfile::tempdir().unwrap();
+            fs::create_dir(directory.path().join("tmux")).unwrap();
+            let wrapper = directory.path().join("tmux-wrapper");
+            fs::write(
+                &wrapper,
+                "#!/bin/sh\nunset TMUX\nexport TMUX_TMPDIR=\"$(dirname \"$0\")/tmux\"\nexec tmux \"$@\"\n",
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&wrapper, permissions).unwrap();
+
+            let sentinel = format!(
+                "david-test-sentinel-{}-{}",
+                std::process::id(),
+                stable_hash(&format!("tmux-test-{label}-sentinel"))
+            );
+            let mut command = Command::new(&wrapper);
+            command.args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                &sentinel,
+                "sleep",
+                "300",
+            ]);
+            assert!(
+                command.status().unwrap().success(),
+                "failed to start private tmux sentinel"
+            );
+
+            Self {
+                directory,
+                wrapper,
+                sentinel,
+            }
         }
 
+        fn backend(&self) -> TmuxBackend {
+            TmuxBackend::new(self.wrapper.as_os_str().to_owned())
+        }
+
+        fn path(&self) -> &Path {
+            self.directory.path()
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new(&self.wrapper);
+            command.args(["-f", "/dev/null"]);
+            command
+        }
+
+        fn kill_sentinel(&self) {
+            assert!(
+                self.command()
+                    .args(["kill-session", "-t"])
+                    .arg(&self.sentinel)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "failed to stop private tmux sentinel"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TmuxTestServer {
+        fn drop(&mut self) {
+            let _ = self.command().arg("kill-server").output();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_backend_configures_managed_session_affordances_when_tmux_is_available() {
         let session = format!(
             "david-test-{}-{}",
             std::process::id(),
             stable_hash("tmux-affordances")
         );
-        let directory = tempfile::tempdir().unwrap();
-        let backend = TmuxBackend::default();
+        let server = TmuxTestServer::new("tmux-affordances");
+        let backend = server.backend();
+        if backend.ensure_available().is_err() {
+            return;
+        }
         let agent = Agent {
             command: "sleep".to_owned(),
             args: vec!["30".to_owned()],
@@ -3712,7 +3911,7 @@ mod tests {
         };
 
         backend
-            .create_session(&session, directory.path(), &agent)
+            .create_session(&session, server.path(), &agent)
             .unwrap();
         backend.configure_session(&session, &metadata).unwrap();
         assert!(backend.has_session(&session).unwrap());
@@ -3750,10 +3949,31 @@ mod tests {
             assert!(output.status.success(), "show-option failed: {option}");
             text(&output.stdout).trim().to_owned()
         };
+        let show_server_option = |option: &str| {
+            let mut command = backend.command();
+            command.args(["show-option", "-v", "-s", option]);
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "show-server-option failed: {option}"
+            );
+            text(&output.stdout).trim().to_owned()
+        };
+        assert_eq!(show_option("mouse"), "on");
+        assert_eq!(show_server_option("extended-keys"), "on");
+        backend.set_option(&session, "mouse", "off").unwrap();
+        backend.set_server_option("extended-keys", "off").unwrap();
+        backend
+            .configure_session_options(&session, &metadata)
+            .unwrap();
+        assert_eq!(show_option("mouse"), "on");
+        assert_eq!(show_server_option("extended-keys"), "on");
         let first_table = show_option("key-table");
         backend.configure_session(&session, &metadata).unwrap();
         let second_table = show_option("key-table");
         assert_ne!(first_table, second_table);
+        assert_eq!(show_option("mouse"), "on");
+        assert_eq!(show_server_option("extended-keys"), "on");
         assert_eq!(show_option("status"), "on");
         assert_eq!(show_option("@david-project"), metadata.project_name);
         assert_eq!(show_option("@david-worktree"), metadata.worktree_name);
@@ -3773,6 +3993,7 @@ mod tests {
                 .any(|line| { line.contains("C-]") && line.contains("detach-client") })
         );
         assert!(keys.lines().any(|line| line.contains("MouseDown1Pane")));
+        assert!(keys.lines().any(|line| line.contains("WheelUpPane")));
 
         let mut prefix = backend.command();
         prefix.args(["list-keys", "-T", "prefix"]);
@@ -4277,6 +4498,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn tmux_configure_session_uses_session_and_server_option_scopes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("fake-tmux");
+        fs::write(
+            &program,
+            "#!/bin/sh\ncount_file=\"$0.count\"\nif [ -f \"$count_file\" ]; then count=$(cat \"$count_file\"); else count=0; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$count_file\"\nprintf '%s\\n' \"$@\" > \"$0.args.$count\"\ncase \" $* \" in\n  *\" list-sessions \"*) printf '%s\\t%s\\n' 'david-managed' 'david-managed:7' ;;\n  *\" @david-project \"*) printf '%s\\n' 'project' ;;\n  *\" @david-worktree \"*) printf '%s\\n' 'feature' ;;\n  *\" @david-agent \"*) printf '%s\\n' 'agent' ;;\n  *\" show-option \"*) printf '%s\\n' 'root' ;;\nesac\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let backend = TmuxBackend::new(program.as_os_str().to_owned());
+        let metadata = SessionMetadata {
+            project_name: "project".to_owned(),
+            worktree_name: "feature".to_owned(),
+            agent_name: "agent".to_owned(),
+        };
+        backend
+            .configure_session("david-managed", &metadata)
+            .unwrap();
+
+        let count: usize = fs::read_to_string(program.with_extension("count"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let invocations = (1..=count)
+            .map(|number| {
+                fs::read_to_string(program.with_extension(format!("args.{number}")))
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(invocations.contains(&vec![
+            "-f".to_owned(),
+            "/dev/null".to_owned(),
+            "set-option".to_owned(),
+            "-t".to_owned(),
+            "david-managed:7".to_owned(),
+            "mouse".to_owned(),
+            "on".to_owned(),
+        ]));
+        assert!(invocations.contains(&vec![
+            "-f".to_owned(),
+            "/dev/null".to_owned(),
+            "set-option".to_owned(),
+            "-s".to_owned(),
+            "extended-keys".to_owned(),
+            "on".to_owned(),
+        ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tmux_session_window_target_uses_the_first_window_index_and_exact_session() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -4364,6 +4644,22 @@ mod tests {
         assert!(error.to_string().contains("tmux is required"));
     }
 
+    #[test]
+    fn tmux_version_requires_extended_key_support() {
+        assert!(!supports_extended_keys("tmux 3.1c"));
+        assert!(supports_extended_keys("tmux 3.2a"));
+        assert!(supports_extended_keys("tmux 3.7b"));
+        assert!(supports_extended_keys("tmux next-3.4"));
+        assert!(!supports_extended_keys("not tmux"));
+        assert!(tmux_server_is_absent(
+            "no server running on /tmp/tmux/default"
+        ));
+        assert!(tmux_server_is_absent(
+            "error connecting to /tmp/tmux/default (No such file or directory)"
+        ));
+        assert!(!tmux_server_is_absent("protocol version mismatch"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn tmux_prompt_reports_transport_failure() {
@@ -4393,15 +4689,13 @@ mod tests {
     fn tmux_backend_delivers_prompt_to_the_managed_agent_pane() {
         use std::os::unix::fs::PermissionsExt;
 
-        let Ok(available) = Command::new("tmux").arg("-V").output() else {
-            return;
-        };
-        if !available.status.success() {
+        let server = TmuxTestServer::new("prompt-delivery");
+        let backend = server.backend();
+        if backend.ensure_available().is_err() {
             return;
         }
-
-        let directory = tempfile::tempdir().unwrap();
-        let reader = directory.path().join("reader.sh");
+        let directory = server.path();
+        let reader = directory.join("reader.sh");
         fs::write(
             &reader,
             "#!/bin/sh\nstty raw -echo\ndd bs=1 count=\"$1\" of=\"$2\" 2>/dev/null\n",
@@ -4411,7 +4705,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&reader, permissions).unwrap();
 
-        let output = directory.path().join("received");
+        let output = directory.join("received");
         let message = "literal Enter C-c Space; $() 😀\nsecond line";
         let expected_len = message.len() + 1;
         let session = format!(
@@ -4419,7 +4713,6 @@ mod tests {
             std::process::id(),
             stable_hash("prompt-delivery")
         );
-        let backend = TmuxBackend::default();
         let agent = Agent {
             command: reader.to_string_lossy().into_owned(),
             args: vec![
@@ -4428,9 +4721,7 @@ mod tests {
             ],
         };
 
-        backend
-            .create_session(&session, directory.path(), &agent)
-            .unwrap();
+        backend.create_session(&session, directory, &agent).unwrap();
         let pane = backend.agent_pane(&session).unwrap().unwrap();
         assert!(pane.starts_with('%'));
         let delivery = backend.deliver_prompt_to(&session, message, Some(&pane));
@@ -4451,32 +4742,41 @@ mod tests {
         assert_eq!(received, Some(expected));
     }
 
+    #[cfg(unix)]
     #[test]
     fn tmux_backend_manages_a_session_when_tmux_is_available() {
-        let Ok(available) = Command::new("tmux").arg("-V").output() else {
-            return;
-        };
-        if !available.status.success() {
-            return;
-        }
-
         let session = format!(
             "david-test-{}-{}",
             std::process::id(),
             stable_hash("tmux-lifecycle")
         );
-        let directory = tempfile::tempdir().unwrap();
-        let backend = TmuxBackend::default();
+        let server = TmuxTestServer::new("tmux-lifecycle");
+        let backend = server.backend();
+        if backend.ensure_available().is_err() {
+            return;
+        }
         let agent = Agent {
             command: "sleep".to_owned(),
             args: vec!["30".to_owned()],
         };
 
         backend
-            .create_session(&session, directory.path(), &agent)
+            .create_session(&session, server.path(), &agent)
             .unwrap();
         assert!(backend.has_session(&session).unwrap());
         backend.kill_session(&session).unwrap();
         assert!(!backend.has_session(&session).unwrap());
+
+        let last_session = format!(
+            "david-test-{}-{}",
+            std::process::id(),
+            stable_hash("tmux-lifecycle-last")
+        );
+        backend
+            .create_session(&last_session, server.path(), &agent)
+            .unwrap();
+        server.kill_sentinel();
+        backend.kill_session(&last_session).unwrap();
+        assert!(!backend.has_session(&last_session).unwrap());
     }
 }

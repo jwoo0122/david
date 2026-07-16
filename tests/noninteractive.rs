@@ -31,22 +31,89 @@ fn init_repo() -> TempDir {
 }
 
 fn tmux_available() -> bool {
-    Command::new("tmux")
+    let Ok(output) = Command::new("tmux")
         .args(["-f", "/dev/null", "-V"])
         .output()
-        .is_ok_and(|output| output.status.success())
+    else {
+        return false;
+    };
+    output.status.success() && supports_extended_keys(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn run_david_with_agent(home: &Path, repo: &Path, args: &[&str], agent: Option<&str>) -> Output {
-    let tmux_tmpdir = home.join("tmux");
-    fs::create_dir_all(&tmux_tmpdir).unwrap();
+fn supports_extended_keys(version: &str) -> bool {
+    let mut numbers = version
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|component| component.parse::<u32>().ok());
+    let Some(major) = numbers.next() else {
+        return false;
+    };
+    let Some(minor) = numbers.next() else {
+        return false;
+    };
+    major > 3 || major == 3 && minor >= 2
+}
+
+fn tmux_with_tmpdir(tmpdir: &Path) -> Command {
+    let mut command = Command::new("tmux");
+    command
+        .args(["-f", "/dev/null"])
+        .env_remove("TMUX")
+        .env("TMUX_TMPDIR", tmpdir);
+    command
+}
+
+struct TmuxTestServer {
+    tmpdir: PathBuf,
+    sentinel: &'static str,
+}
+
+impl TmuxTestServer {
+    fn new(home: &Path) -> Self {
+        let tmpdir = home.join("tmux");
+        fs::create_dir_all(&tmpdir).unwrap();
+        let server = Self {
+            tmpdir,
+            sentinel: "david-test-sentinel",
+        };
+        assert!(
+            tmux_with_tmpdir(&server.tmpdir)
+                .args(["new-session", "-d", "-s", server.sentinel, "sleep", "300"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        server
+    }
+
+    fn configure(&self, command: &mut Command) {
+        command.env("TMUX_TMPDIR", &self.tmpdir).env_remove("TMUX");
+    }
+}
+
+impl Drop for TmuxTestServer {
+    fn drop(&mut self) {
+        let _ = tmux_with_tmpdir(&self.tmpdir)
+            .arg("kill-server")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+fn run_david_with_agent(
+    server: &TmuxTestServer,
+    home: &Path,
+    repo: &Path,
+    args: &[&str],
+    agent: Option<&str>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_david"));
     command
         .current_dir(repo)
         .env("HOME", home)
-        .env("TMUX_TMPDIR", tmux_tmpdir)
         .args(args)
         .stdin(Stdio::null());
+    server.configure(&mut command);
     if let Some(agent) = agent {
         command.env("DAVID_AGENT", agent);
     } else {
@@ -55,8 +122,8 @@ fn run_david_with_agent(home: &Path, repo: &Path, args: &[&str], agent: Option<&
     command.output().unwrap()
 }
 
-fn run_david(home: &Path, repo: &Path, args: &[&str]) -> Output {
-    run_david_with_agent(home, repo, args, None)
+fn run_david(server: &TmuxTestServer, home: &Path, repo: &Path, args: &[&str]) -> Output {
+    run_david_with_agent(server, home, repo, args, None)
 }
 
 fn write_config(home: &Path, content: &str) {
@@ -90,8 +157,9 @@ fn noninteractive_missing_selection_exits_two_without_waiting_or_creating() {
             home.path(),
             "[agents.codex]\ncommand = \"echo\"\n\n[agents.claude]\ncommand = \"echo\"\n",
         );
+        let server = TmuxTestServer::new(home.path());
 
-        let output = run_david(home.path(), repo.path(), &args);
+        let output = run_david(&server, home.path(), repo.path(), &args);
 
         assert_eq!(output.status.code(), Some(2), "stderr: {:?}", output.stderr);
         assert!(String::from_utf8_lossy(&output.stderr).contains("non-interactive"));
@@ -111,8 +179,10 @@ fn environment_agent_overrides_another_configured_default() {
         home.path(),
         "default_agent = \"other\"\n\n[agents.codex]\ncommand = \"sleep\"\nargs = [\"30\"]\n\n[agents.other]\ncommand = \"missing-agent\"\n",
     );
+    let server = TmuxTestServer::new(home.path());
 
     let output = run_david_with_agent(
+        &server,
         home.path(),
         repo.path(),
         &["run", "--no-interactive", "feature"],
@@ -121,7 +191,12 @@ fn environment_agent_overrides_another_configured_default() {
 
     assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
     assert!(managed_feature(home.path()).is_dir());
-    let cleanup = run_david(home.path(), repo.path(), &["remove", "--force", "feature"]);
+    let cleanup = run_david(
+        &server,
+        home.path(),
+        repo.path(),
+        &["remove", "--force", "feature"],
+    );
     assert_eq!(
         cleanup.status.code(),
         Some(0),
@@ -158,8 +233,10 @@ fn noninteractive_run_uses_default_agent_and_literal_runtime_argv_without_attach
             script.to_string_lossy()
         ),
     );
+    let server = TmuxTestServer::new(home.path());
 
     let output = run_david(
+        &server,
         home.path(),
         repo.path(),
         &[
@@ -187,7 +264,12 @@ fn noninteractive_run_uses_default_agent_and_literal_runtime_argv_without_attach
         "configured\n--model\ngpt 5.6\n$()\n"
     );
 
-    let cleanup = run_david(home.path(), repo.path(), &["remove", "--force", "feature"]);
+    let cleanup = run_david(
+        &server,
+        home.path(),
+        repo.path(),
+        &["remove", "--force", "feature"],
+    );
     assert_eq!(
         cleanup.status.code(),
         Some(0),

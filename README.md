@@ -5,10 +5,12 @@
 ## Prerequisites
 
 - Git
-- tmux
+- tmux 3.2 or newer
 - Rust and Cargo for building
 
 The first version targets macOS and Linux.
+
+David-managed sessions do not load `~/.tmux.conf`; david explicitly enables session-scoped mouse support and server-scoped extended keys for them. The latter affects other sessions sharing the tmux server; use a separate server if that is unacceptable.
 
 ## Install
 
