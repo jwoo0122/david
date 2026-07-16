@@ -78,7 +78,7 @@ List managed worktrees and agents:
 david list
 ```
 
-Detach from tmux without stopping the agent with `Ctrl-b`, then `d`.
+While attached, the tmux status line shows the `DAVID` marker, project/worktree/agent names, and the detach shortcut. Detach without stopping the agent with `Ctrl-]`. The standard `Ctrl-b`, then `d`, sequence remains available as a fallback.
 
 Remove a clean worktree, its agent session, and its paired branch:
 

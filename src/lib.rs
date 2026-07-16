@@ -9,6 +9,9 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Output},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ToolError>;
@@ -101,6 +104,13 @@ pub struct Agent {
 pub struct Config {
     #[serde(default)]
     pub agents: BTreeMap<String, Agent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMetadata {
+    pub project_name: String,
+    pub worktree_name: String,
+    pub agent_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,7 +332,7 @@ impl Git {
         fs::canonicalize(path).map_err(ToolError::Io)
     }
 
-    fn repository_id(&self, root: &Path) -> Result<String> {
+    fn common_git_dir(&self, root: &Path) -> Result<PathBuf> {
         let mut command = self.command(root);
         command.args(["rev-parse", "--git-common-dir"]);
         let output = self.output(command)?;
@@ -332,7 +342,34 @@ impl Git {
         } else {
             root.join(raw)
         };
-        repository_id(&common_dir)
+        fs::canonicalize(common_dir).map_err(ToolError::Io)
+    }
+
+    fn repository_id(&self, root: &Path) -> Result<String> {
+        repository_id(&self.common_git_dir(root)?)
+    }
+
+    fn repository_name(&self, root: &Path) -> Result<String> {
+        let common_dir = self.common_git_dir(root)?;
+        let project_dir = if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            common_dir.parent().unwrap_or(&common_dir).to_path_buf()
+        } else {
+            self.worktrees(root)?
+                .into_iter()
+                .next()
+                .map(|worktree| worktree.path)
+                .unwrap_or_else(|| root.to_path_buf())
+        };
+        project_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                ToolError::Message(format!(
+                    "could not determine project name from source directory: {}",
+                    project_dir.display()
+                ))
+            })
     }
 
     fn current_head(&self, root: &Path) -> Result<()> {
@@ -457,6 +494,9 @@ pub trait SessionBackend {
     fn ensure_available(&self) -> Result<()>;
     fn has_session(&self, name: &str) -> Result<bool>;
     fn create_session(&self, name: &str, cwd: &Path, agent: &Agent) -> Result<()>;
+    fn configure_session(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
+        Ok(())
+    }
     fn attach(&self, name: &str) -> Result<()>;
     fn kill_session(&self, name: &str) -> Result<()>;
 }
@@ -491,6 +531,158 @@ impl TmuxBackend {
             detail: format!("exited with status {status}"),
         }
     }
+
+    fn output(&self, mut command: Command) -> Result<Output> {
+        let output = command.output()?;
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(command_error("tmux", &output))
+        }
+    }
+
+    fn run_command(&self, command: Command) -> Result<()> {
+        self.output(command).map(|_| ())
+    }
+
+    fn session_id(&self, session: &str) -> Result<String> {
+        let mut command = self.command();
+        command.args(["list-sessions", "-F", "#{session_name}\t#{session_id}"]);
+        let output = self.output(command)?;
+        for line in text(&output.stdout).lines() {
+            let Some((name, id)) = line.split_once('\t') else {
+                continue;
+            };
+            if name == session {
+                return Ok(id.to_owned());
+            }
+        }
+        Err(ToolError::Message(format!(
+            "tmux session {session} no longer exists"
+        )))
+    }
+
+    fn set_option(&self, session: &str, option: &str, value: &str) -> Result<()> {
+        let target = self.session_id(session)?;
+        let mut command = self.command();
+        command
+            .args(["set-option", "-t"])
+            .arg(target)
+            .args([option, value]);
+        self.run_command(command)
+    }
+
+    fn show_option(&self, session: &str, option: &str) -> Result<String> {
+        let target = self.session_id(session)?;
+        let mut command = self.command();
+        command
+            .args(["show-option", "-v", "-t"])
+            .arg(target)
+            .arg(option);
+        let output = self.output(command)?;
+        Ok(text(&output.stdout).trim().to_owned())
+    }
+
+    fn configure_key_table(&self, session: &str) -> Result<()> {
+        let tables = session_key_tables(session);
+        let active = self.show_option(session, "key-table")?;
+        let active = if active.is_empty() {
+            "root".to_owned()
+        } else {
+            active
+        };
+        let staging = if active == tables[0] {
+            &tables[1]
+        } else {
+            &tables[0]
+        };
+
+        let mut list = self.command();
+        list.args(["list-keys", "-T", &active, "-a"]);
+        let output = self.output(list)?;
+        let source_table = format!("-T {active}");
+        let replacement = format!("-T {staging}");
+        let mut bindings = String::new();
+        for line in text(&output.stdout).lines() {
+            bindings.push_str(&line.replacen(&source_table, &replacement, 1));
+            bindings.push('\n');
+        }
+        bindings.push_str(&format!("bind-key -T {staging} C-] detach-client\n"));
+
+        let mut clear = self.command();
+        clear.args(["unbind-key", "-q", "-a", "-T", staging]);
+        self.run_command(clear)?;
+
+        let directory = env::temp_dir().join(format!(
+            ".david-key-table-{}-{}",
+            stable_hash(staging),
+            std::process::id()
+        ));
+        let path = directory.join("bindings.conf");
+        let mut owns_directory = false;
+        let mut owns_file = false;
+        let result = (|| {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(&directory)?;
+            owns_directory = true;
+
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&path)?;
+            owns_file = true;
+            file.write_all(bindings.as_bytes())?;
+            let mut source = self.command();
+            source.arg("source-file").arg(&path);
+            self.run_command(source)
+        })();
+        let mut cleanup_errors = Vec::new();
+        if owns_file && let Err(error) = fs::remove_file(&path) {
+            cleanup_errors.push(format!("file: {error}"));
+        }
+        if owns_directory && let Err(error) = fs::remove_dir(&directory) {
+            cleanup_errors.push(format!("directory: {error}"));
+        }
+        let cleanup = if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ToolError::Message(format!(
+                "failed to remove temporary tmux configuration ({})",
+                cleanup_errors.join(", ")
+            )))
+        };
+        match (result, cleanup) {
+            (Err(error), Err(cleanup_error)) => {
+                return Err(ToolError::Message(format!("{error}; {cleanup_error}")));
+            }
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(()), Err(cleanup_error)) => return Err(cleanup_error),
+            (Ok(()), Ok(())) => {}
+        }
+
+        self.set_option(session, "key-table", staging)?;
+        if tables.iter().any(|table| table == &active) && active != *staging {
+            self.clear_key_table(&active)?;
+        }
+        Ok(())
+    }
+
+    fn clear_key_table(&self, table: &str) -> Result<()> {
+        let mut command = self.command();
+        command.args(["unbind-key", "-q", "-a", "-T", table]);
+        self.run_command(command)
+    }
+
+    fn clear_key_tables(&self, session: &str) -> Result<()> {
+        for table in session_key_tables(session) {
+            self.clear_key_table(&table)?;
+        }
+        Ok(())
+    }
 }
 
 impl SessionBackend for TmuxBackend {
@@ -512,7 +704,12 @@ impl SessionBackend for TmuxBackend {
     }
 
     fn has_session(&self, name: &str) -> Result<bool> {
-        let output = self.command().args(["has-session", "-t", name]).output()?;
+        let target = exact_session_target(name);
+        let output = self
+            .command()
+            .args(["has-session", "-t"])
+            .arg(target)
+            .output()?;
         if output.status.success() {
             Ok(true)
         } else if output.status.code() == Some(1) {
@@ -534,21 +731,29 @@ impl SessionBackend for TmuxBackend {
         if !output.status.success() {
             return Err(command_error("tmux", &output));
         }
+        Ok(())
+    }
 
-        let mut status = self.command();
-        status.args(["set-option", "-t", name, "status", "off"]);
-        let output = status.output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            let _ = self.kill_session(name);
-            Err(command_error("tmux", &output))
-        }
+    fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+        self.set_option(name, "@david-project", &metadata.project_name)?;
+        self.set_option(name, "@david-worktree", &metadata.worktree_name)?;
+        self.set_option(name, "@david-agent", &metadata.agent_name)?;
+        self.configure_key_table(name)?;
+        self.set_option(name, "status", "on")?;
+        self.set_option(
+            name,
+            "status-left",
+            "[DAVID] project: #{@david-project} | worktree: #{@david-worktree} | agent: #{@david-agent}",
+        )?;
+        self.set_option(name, "status-left-length", &status_left_length(metadata))?;
+        self.set_option(name, "status-right", "detach: Ctrl-]")?;
+        self.set_option(name, "status-right-length", "32")
     }
 
     fn attach(&self, name: &str) -> Result<()> {
+        let target = self.session_id(name)?;
         let mut command = self.command();
-        command.args(["attach-session", "-t", name]);
+        command.args(["attach-session", "-t"]).arg(target);
         let status = command.status()?;
         if status.success() || !self.has_session(name)? {
             Ok(())
@@ -559,15 +764,20 @@ impl SessionBackend for TmuxBackend {
 
     fn kill_session(&self, name: &str) -> Result<()> {
         if !self.has_session(name)? {
-            return Ok(());
+            return self.clear_key_tables(name);
         }
+        let target = self.session_id(name)?;
         let mut command = self.command();
-        command.args(["kill-session", "-t", name]);
-        let output = command.output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(command_error("tmux", &output))
+        command.args(["kill-session", "-t"]).arg(target);
+        let kill_result = self.output(command);
+        let cleanup_result = self.clear_key_tables(name);
+        match (kill_result, cleanup_result) {
+            (Ok(_), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(kill_error), Err(cleanup_error)) => Err(ToolError::Message(format!(
+                "{kill_error}; failed to clean up session key tables: {cleanup_error}"
+            ))),
         }
     }
 }
@@ -601,6 +811,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
 
         let root = self.git.repository_root(cwd)?;
         let repo_id = self.git.repository_id(&root)?;
+        let project_name = self.git.repository_name(&root)?;
         let target = self.paths.worktree_path(&repo_id, name);
         let existing = self.find_worktree(&root, &target)?;
 
@@ -645,6 +856,12 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                     "tmux session {session} metadata does not match the requested worktree"
                 )));
             }
+            let metadata = SessionMetadata {
+                project_name: project_name.clone(),
+                worktree_name: name.to_owned(),
+                agent_name: state.agent,
+            };
+            self.sessions.configure_session(&session, &metadata)?;
             return self.sessions.attach(&session);
         }
         if state_path.exists() {
@@ -675,6 +892,11 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
 
         self.paths.prepare()?;
+        let metadata = SessionMetadata {
+            project_name,
+            worktree_name: name.to_owned(),
+            agent_name: agent_name.clone(),
+        };
         let state = SessionState {
             repo_id: repo_id.clone(),
             worktree_name: name.to_owned(),
@@ -689,7 +911,39 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             return Err(error);
         }
         if !self.sessions.has_session(&session)? {
-            let _ = fs::remove_file(&state_path);
+            fs::remove_file(&state_path)?;
+            return Err(ToolError::Message(format!(
+                "agent session {session} exited before it could be attached"
+            )));
+        }
+        if let Err(error) = self.sessions.configure_session(&session, &metadata) {
+            let alive = match self.sessions.has_session(&session) {
+                Ok(alive) => alive,
+                Err(check_error) => {
+                    return Err(ToolError::Message(format!(
+                        "{error}; could not verify agent session cleanup: {check_error}"
+                    )));
+                }
+            };
+            if alive && let Err(cleanup_error) = self.sessions.kill_session(&session) {
+                return Err(ToolError::Message(format!(
+                    "{error}; failed to clean up agent session: {cleanup_error}"
+                )));
+            }
+            if let Err(state_error) = fs::remove_file(&state_path) {
+                return Err(ToolError::Message(format!(
+                    "{error}; failed to remove session metadata: {state_error}"
+                )));
+            }
+            if !alive {
+                return Err(ToolError::Message(format!(
+                    "agent session {session} exited before it could be attached"
+                )));
+            }
+            return Err(error);
+        }
+        if !self.sessions.has_session(&session)? {
+            fs::remove_file(&state_path)?;
             return Err(ToolError::Message(format!(
                 "agent session {session} exited before it could be attached"
             )));
@@ -866,6 +1120,23 @@ fn session_name(repo_id: &str, worktree_name: &str) -> String {
     format!("david-{repo_id}-{}", stable_hash(worktree_name))
 }
 
+fn exact_session_target(session: &str) -> String {
+    format!("={session}")
+}
+
+fn session_key_tables(session: &str) -> [String; 2] {
+    let base = format!("david-keys-{}", stable_hash(session));
+    [format!("{base}-a"), format!("{base}-b")]
+}
+
+fn status_left_length(metadata: &SessionMetadata) -> String {
+    let length = "[DAVID] project:  | worktree:  | agent: ".chars().count()
+        + metadata.project_name.chars().count()
+        + metadata.worktree_name.chars().count()
+        + metadata.agent_name.chars().count();
+    length.to_string()
+}
+
 fn write_config(path: &Path, config: &Config) -> Result<()> {
     let temporary = path.with_file_name(format!(
         ".{}.tmp-{}",
@@ -996,8 +1267,11 @@ mod tests {
     struct FakeSessionState {
         live: BTreeSet<String>,
         created: Vec<String>,
+        configured: Vec<(String, SessionMetadata)>,
         attached: Vec<String>,
         killed: Vec<String>,
+        configure_error: Option<String>,
+        kill_error: Option<String>,
     }
 
     impl SessionBackend for FakeSessions {
@@ -1016,6 +1290,15 @@ mod tests {
             Ok(())
         }
 
+        fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+            let mut state = self.state.borrow_mut();
+            if let Some(message) = &state.configure_error {
+                return Err(ToolError::Message(message.clone()));
+            }
+            state.configured.push((name.to_owned(), metadata.clone()));
+            Ok(())
+        }
+
         fn attach(&self, name: &str) -> Result<()> {
             self.state.borrow_mut().attached.push(name.to_owned());
             Ok(())
@@ -1023,6 +1306,9 @@ mod tests {
 
         fn kill_session(&self, name: &str) -> Result<()> {
             let mut state = self.state.borrow_mut();
+            if let Some(message) = &state.kill_error {
+                return Err(ToolError::Message(message.clone()));
+            }
             state.live.remove(name);
             state.killed.push(name.to_owned());
             Ok(())
@@ -1223,12 +1509,27 @@ mod tests {
 
         let id = Git::default().repository_id(repo.path()).unwrap();
         let target = paths.worktree_path(&id, "feature");
+        let project = repo
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let expected = SessionMetadata {
+            project_name: project,
+            worktree_name: "feature".to_owned(),
+            agent_name: "test".to_owned(),
+        };
         assert!(target.is_dir());
         assert_eq!(sessions.state.borrow().created.len(), 1);
+        assert_eq!(sessions.state.borrow().configured.len(), 1);
+        assert_eq!(sessions.state.borrow().configured[0].1, expected);
         assert_eq!(sessions.state.borrow().attached.len(), 1);
 
         app.run(repo.path(), "feature").unwrap();
         assert_eq!(sessions.state.borrow().created.len(), 1);
+        assert_eq!(sessions.state.borrow().configured.len(), 2);
+        assert_eq!(sessions.state.borrow().configured[1].1, expected);
         assert_eq!(sessions.state.borrow().attached.len(), 2);
     }
 
@@ -1295,7 +1596,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let paths = configured_paths(home.path());
         let sessions = FakeSessions::default();
-        let app = test_app(paths.clone(), sessions);
+        let app = test_app(paths.clone(), sessions.clone());
 
         app.run(repo.path(), "first").unwrap();
         let first =
@@ -1306,7 +1607,26 @@ mod tests {
             &Git::default().repository_id(repo.path()).unwrap(),
             "second",
         );
+        let project = repo
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert!(second.is_dir());
+        assert_eq!(sessions.state.borrow().configured.len(), 2);
+        assert_eq!(
+            sessions.state.borrow().configured[0].1.project_name,
+            project
+        );
+        assert_eq!(
+            sessions.state.borrow().configured[1].1.project_name,
+            sessions.state.borrow().configured[0].1.project_name
+        );
+        assert_eq!(
+            sessions.state.borrow().configured[1].1.worktree_name,
+            "second"
+        );
     }
 
     #[test]
@@ -1347,6 +1667,69 @@ mod tests {
     }
 
     #[test]
+    fn new_session_configuration_failure_rolls_back_session_and_state() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        sessions.state.borrow_mut().configure_error = Some("configuration failed".to_owned());
+        let app = test_app(paths.clone(), sessions.clone());
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+
+        assert_eq!(error.to_string(), "configuration failed");
+        let id = Git::default().repository_id(repo.path()).unwrap();
+        let session = session_name(&id, "feature");
+        let state_path = paths.session_state_path(&id, "feature");
+        assert!(!sessions.state.borrow().live.contains(&session));
+        assert_eq!(sessions.state.borrow().killed, vec![session]);
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn existing_session_configuration_failure_keeps_agent_alive() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths, sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        sessions.state.borrow_mut().configure_error = Some("configuration failed".to_owned());
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+
+        assert_eq!(error.to_string(), "configuration failed");
+        assert_eq!(sessions.state.borrow().killed.len(), 0);
+        assert_eq!(sessions.state.borrow().attached.len(), 1);
+        assert_eq!(sessions.state.borrow().live.len(), 1);
+    }
+
+    #[test]
+    fn new_session_configuration_failure_keeps_state_when_cleanup_fails() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        sessions.state.borrow_mut().configure_error = Some("configuration failed".to_owned());
+        sessions.state.borrow_mut().kill_error = Some("kill failed".to_owned());
+        let app = test_app(paths.clone(), sessions.clone());
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to clean up agent session")
+        );
+        let id = Git::default().repository_id(repo.path()).unwrap();
+        let session = session_name(&id, "feature");
+        let state_path = paths.session_state_path(&id, "feature");
+        assert!(sessions.state.borrow().live.contains(&session));
+        assert!(state_path.exists());
+    }
+
+    #[test]
     fn list_reports_active_agent() {
         let repo = init_repo();
         let home = tempfile::tempdir().unwrap();
@@ -1362,8 +1745,10 @@ mod tests {
     }
 
     #[test]
-    fn tmux_backend_manages_a_session_when_tmux_is_available() {
-        let available = Command::new("tmux").arg("-V").output().unwrap();
+    fn tmux_backend_configures_managed_session_affordances_when_tmux_is_available() {
+        let Ok(available) = Command::new("tmux").arg("-V").output() else {
+            return;
+        };
         if !available.status.success() {
             return;
         }
@@ -1375,12 +1760,88 @@ mod tests {
             command: "sleep".to_owned(),
             args: vec!["30".to_owned()],
         };
+        let metadata = SessionMetadata {
+            project_name: "source-%H-#{session_name}".to_owned(),
+            worktree_name: "feature-#[fg=red]-%M".to_owned(),
+            agent_name: "codex-#S-%d".to_owned(),
+        };
 
         backend
             .create_session(&session, directory.path(), &agent)
             .unwrap();
+        backend.configure_session(&session, &metadata).unwrap();
         assert!(backend.has_session(&session).unwrap());
+
+        let show_option = |option: &str| {
+            let mut command = backend.command();
+            command.args(["show-option", "-v", "-t", &session, option]);
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "show-option failed: {option}");
+            text(&output.stdout).trim().to_owned()
+        };
+        let first_table = show_option("key-table");
+        backend.configure_session(&session, &metadata).unwrap();
+        let second_table = show_option("key-table");
+        assert_ne!(first_table, second_table);
+        assert_eq!(show_option("status"), "on");
+        assert_eq!(show_option("@david-project"), metadata.project_name);
+        assert_eq!(show_option("@david-worktree"), metadata.worktree_name);
+        assert_eq!(show_option("@david-agent"), metadata.agent_name);
+        assert!(show_option("status-left").contains("@david-project"));
+        assert_eq!(show_option("status-right"), "detach: Ctrl-]");
+
+        let table = second_table;
+        assert!(session_key_tables(&session).contains(&table));
+        let mut keys = backend.command();
+        keys.args(["list-keys", "-T", &table, "-a"]);
+        let output = keys.output().unwrap();
+        assert!(output.status.success());
+        let keys = text(&output.stdout);
+        assert!(
+            keys.lines()
+                .any(|line| { line.contains("C-]") && line.contains("detach-client") })
+        );
+        assert!(keys.lines().any(|line| line.contains("MouseDown1Pane")));
+
+        let mut prefix = backend.command();
+        prefix.args(["list-keys", "-T", "prefix"]);
+        let output = prefix.output().unwrap();
+        assert!(output.status.success());
+        let prefix = text(&output.stdout);
+        assert!(
+            prefix
+                .lines()
+                .any(|line| line.contains(" d ") && line.contains("detach-client"))
+        );
+
+        let mut display = backend.command();
+        display.args([
+            "display-message",
+            "-p",
+            "-t",
+            &session,
+            "#{T:status-left}|#{T:status-right}",
+        ]);
+        let output = display.output().unwrap();
+        assert!(output.status.success());
+        let rendered = text(&output.stdout);
+        let expected = format!(
+            "[DAVID] project: {} | worktree: {} | agent: {}|detach: Ctrl-]",
+            metadata.project_name, metadata.worktree_name, metadata.agent_name
+        );
+        assert_eq!(rendered.trim(), expected);
+
         backend.kill_session(&session).unwrap();
         assert!(!backend.has_session(&session).unwrap());
+        let mut keys = backend.command();
+        keys.args(["list-keys", "-a"]);
+        let output = keys.output().unwrap();
+        assert!(output.status.success());
+        let keys = text(&output.stdout);
+        assert!(
+            session_key_tables(&session)
+                .iter()
+                .all(|table| !keys.contains(table))
+        );
     }
 }
