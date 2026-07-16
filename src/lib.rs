@@ -7,7 +7,8 @@ use std::{
     fs,
     io::{self, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Output},
+    process::{Command, ExitStatus, Output, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[cfg(unix)]
@@ -91,6 +92,26 @@ impl DavidPaths {
         self.sessions
             .join(format!("{}-{}.state", repo_id, stable_hash(name)))
     }
+
+    fn validate_worktree_path(&self, repo_id: &str, name: &str) -> Result<()> {
+        let path_error = || {
+            ToolError::Message(format!(
+                "managed worktree path escapes the managed directory: {name}"
+            ))
+        };
+        let canonical_worktrees = canonicalize_with_missing(&self.worktrees)?;
+        let base = self.repository_worktrees(repo_id);
+        let canonical_base = canonicalize_with_missing(&base).map_err(|_| path_error())?;
+        let target = self.worktree_path(repo_id, name);
+        let canonical_target = canonicalize_with_missing(&target).map_err(|_| path_error())?;
+
+        if !canonical_base.starts_with(&canonical_worktrees)
+            || !canonical_target.starts_with(&canonical_base)
+        {
+            return Err(path_error());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -121,6 +142,7 @@ struct SessionState {
     branch: String,
     session: String,
     agent: String,
+    pane: Option<String>,
 }
 
 impl SessionState {
@@ -133,7 +155,7 @@ impl SessionState {
     }
 
     fn encode(&self) -> String {
-        format!(
+        let mut encoded = format!(
             "repo_id={}\nworktree_name={}\nworktree_path={}\nbranch={}\nsession={}\nagent={}\n",
             self.repo_id,
             self.worktree_name,
@@ -141,7 +163,13 @@ impl SessionState {
             self.branch,
             self.session,
             self.agent
-        )
+        );
+        if let Some(pane) = &self.pane {
+            encoded.push_str("pane=");
+            encoded.push_str(pane);
+            encoded.push('\n');
+        }
+        encoded
     }
 }
 
@@ -494,10 +522,33 @@ pub trait SessionBackend {
     fn ensure_available(&self) -> Result<()>;
     fn has_session(&self, name: &str) -> Result<bool>;
     fn create_session(&self, name: &str, cwd: &Path, agent: &Agent) -> Result<()>;
+    fn create_session_with_pane(
+        &self,
+        name: &str,
+        cwd: &Path,
+        agent: &Agent,
+    ) -> Result<Option<String>> {
+        self.create_session(name, cwd, agent)?;
+        self.agent_pane(name)
+    }
+    fn agent_pane(&self, _name: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn pane_is_alive(&self, _name: &str, _pane: &str) -> Result<bool> {
+        Ok(true)
+    }
     fn configure_session(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
         Ok(())
     }
     fn attach(&self, name: &str) -> Result<()>;
+    fn deliver_prompt(&self, _name: &str, _message: &str) -> Result<()> {
+        Err(ToolError::Message(
+            "session backend does not support prompt delivery".to_owned(),
+        ))
+    }
+    fn deliver_prompt_to(&self, name: &str, message: &str, _pane: Option<&str>) -> Result<()> {
+        self.deliver_prompt(name, message)
+    }
     fn kill_session(&self, name: &str) -> Result<()>;
 }
 
@@ -683,6 +734,174 @@ impl TmuxBackend {
         }
         Ok(())
     }
+
+    fn session_window_target(&self, name: &str) -> Result<String> {
+        let target = exact_session_target(name);
+        let mut command = self.command();
+        command
+            .args(["list-windows", "-F", "#{window_index}", "-t"])
+            .arg(target);
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(command_error("tmux", &output));
+        }
+        let index = text(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_owned();
+        if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
+            return Err(ToolError::Message(format!(
+                "tmux session {name} returned an invalid window index"
+            )));
+        }
+        Ok(format!("{}:{index}", exact_session_target(name)))
+    }
+
+    fn pane_metadata(&self, name: &str, pane: &str) -> Result<(String, bool)> {
+        if !valid_pane_id(pane) {
+            return Err(ToolError::Message(format!(
+                "tmux pane target is invalid: {pane}"
+            )));
+        }
+        let mut command = self.command();
+        command
+            .args(["display-message", "-p", "-t"])
+            .arg(pane)
+            .arg("#{session_name}|#{window_index}|#{pane_dead}");
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(command_error("tmux", &output));
+        }
+
+        let detail = text(&output.stdout);
+        let mut fields = detail.trim().split('|');
+        let (Some(session), Some(window), Some(pane_dead)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(ToolError::Message(format!(
+                "tmux pane {pane} returned invalid metadata"
+            )));
+        };
+        if fields.next().is_some() {
+            return Err(ToolError::Message(format!(
+                "tmux pane {pane} returned invalid metadata"
+            )));
+        }
+        if session != name {
+            return Err(ToolError::Message(format!(
+                "tmux pane {pane} does not belong to exact session {name}"
+            )));
+        }
+        if window.is_empty() {
+            return Err(ToolError::Message(format!(
+                "tmux pane {pane} returned an empty window index"
+            )));
+        }
+        let alive = match pane_dead {
+            "0" => true,
+            "1" => false,
+            _ => {
+                return Err(ToolError::Message(format!(
+                    "tmux pane {pane} returned an invalid liveness value"
+                )));
+            }
+        };
+        Ok((window.to_owned(), alive))
+    }
+
+    fn delete_buffer(&self, buffer: &str) {
+        let mut command = self.command();
+        command.args(["delete-buffer", "-b"]).arg(buffer);
+        let _ = command.output();
+    }
+
+    fn pane_target(&self, name: &str, pane: &str) -> Result<String> {
+        let (window, alive) = self.pane_metadata(name, pane)?;
+        if !alive {
+            return Err(ToolError::Message(format!("tmux pane {pane} is dead")));
+        }
+        Ok(format!(
+            "{}:{}.{}",
+            exact_session_target(name),
+            window,
+            pane
+        ))
+    }
+
+    fn deliver_prompt_at(&self, pane: &str, message: &str) -> Result<()> {
+        let buffer = (!message.is_empty()).then(prompt_buffer_name);
+        let mut command = self.command();
+        if let Some(buffer) = buffer.as_deref() {
+            command
+                .args(["load-buffer", "-b"])
+                .arg(buffer)
+                .args(["-"])
+                .arg(";")
+                .args(["paste-buffer", "-dprS", "-b"])
+                .arg(buffer)
+                .args(["-t"])
+                .arg(pane)
+                .arg(";");
+        }
+        command.args(["send-keys", "-t"]).arg(pane).arg("Enter");
+
+        let cleanup = || {
+            if let Some(buffer) = buffer.as_deref() {
+                self.delete_buffer(buffer);
+            }
+        };
+        let mut child = match command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                cleanup();
+                return Err(if error.kind() == io::ErrorKind::NotFound {
+                    ToolError::Message(
+                        "tmux is required but was not found; install tmux and retry".to_owned(),
+                    )
+                } else {
+                    ToolError::Io(error)
+                });
+            }
+        };
+
+        let Some(mut input) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup();
+            return Err(ToolError::Message(
+                "tmux prompt transport did not provide stdin".to_owned(),
+            ));
+        };
+        if let Err(error) = input.write_all(message.as_bytes()) {
+            drop(input);
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup();
+            return Err(ToolError::Io(error));
+        }
+        drop(input);
+
+        let output = match child.wait_with_output() {
+            Ok(output) => output,
+            Err(error) => {
+                cleanup();
+                return Err(ToolError::Io(error));
+            }
+        };
+        if output.status.success() {
+            Ok(())
+        } else {
+            cleanup();
+            Err(command_error("tmux", &output))
+        }
+    }
 }
 
 impl SessionBackend for TmuxBackend {
@@ -720,9 +939,27 @@ impl SessionBackend for TmuxBackend {
     }
 
     fn create_session(&self, name: &str, cwd: &Path, agent: &Agent) -> Result<()> {
+        self.create_session_with_pane(name, cwd, agent).map(|_| ())
+    }
+
+    fn create_session_with_pane(
+        &self,
+        name: &str,
+        cwd: &Path,
+        agent: &Agent,
+    ) -> Result<Option<String>> {
         let mut command = self.command();
         command
-            .args(["new-session", "-d", "-s", name, "-c"])
+            .args([
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                name,
+                "-c",
+            ])
             .arg(cwd)
             .arg("--")
             .arg(&agent.command)
@@ -731,7 +968,39 @@ impl SessionBackend for TmuxBackend {
         if !output.status.success() {
             return Err(command_error("tmux", &output));
         }
-        Ok(())
+        let pane = text(&output.stdout).trim().to_owned();
+        if !valid_pane_id(&pane) {
+            let _ = self.kill_session(name);
+            return Err(ToolError::Message(format!(
+                "tmux session {name} returned an invalid pane id"
+            )));
+        }
+
+        let target = match self.session_window_target(name) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = self.kill_session(name);
+                return Err(error);
+            }
+        };
+        let mut status = self.command();
+        status
+            .args(["set-option", "-t"])
+            .arg(target)
+            .args(["status", "off"]);
+        let output = match status.output() {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self.kill_session(name);
+                return Err(ToolError::Io(error));
+            }
+        };
+        if output.status.success() {
+            Ok(Some(pane))
+        } else {
+            let _ = self.kill_session(name);
+            Err(command_error("tmux", &output))
+        }
     }
 
     fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
@@ -760,6 +1029,120 @@ impl SessionBackend for TmuxBackend {
         } else {
             Err(self.status_error(status))
         }
+    }
+
+    fn agent_pane(&self, name: &str) -> Result<Option<String>> {
+        let target = exact_session_target(name);
+        let mut command = self.command();
+        command
+            .args(["list-panes", "-s", "-t"])
+            .arg(target)
+            .args(["-F", "#{pane_id}|#{session_name}|#{pane_dead}"]);
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(command_error("tmux", &output));
+        }
+
+        let pane_output = text(&output.stdout);
+        let line = pane_output
+            .lines()
+            .next()
+            .ok_or_else(|| ToolError::Message(format!("tmux session {name} has no agent pane")))?;
+        let mut fields = line.split('|');
+        let (Some(pane), Some(session), Some(pane_dead)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(ToolError::Message(format!(
+                "tmux session {name} returned invalid pane metadata"
+            )));
+        };
+        if fields.next().is_some() {
+            return Err(ToolError::Message(format!(
+                "tmux session {name} returned invalid pane metadata"
+            )));
+        }
+        if session != name {
+            return Err(ToolError::Message(format!(
+                "tmux pane {pane} does not belong to exact session {name}"
+            )));
+        }
+        if !valid_pane_id(pane) {
+            return Err(ToolError::Message(format!(
+                "tmux session {name} returned an invalid pane id"
+            )));
+        }
+        match pane_dead {
+            "0" => {}
+            "1" => {
+                return Err(ToolError::Message(format!("tmux pane {pane} is dead")));
+            }
+            _ => {
+                return Err(ToolError::Message(format!(
+                    "tmux session {name} returned an invalid pane liveness value"
+                )));
+            }
+        }
+        Ok(Some(pane.to_owned()))
+    }
+
+    fn pane_is_alive(&self, name: &str, pane: &str) -> Result<bool> {
+        if !valid_pane_id(pane) {
+            return Err(ToolError::Message(format!(
+                "tmux pane target is invalid: {pane}"
+            )));
+        }
+        let mut command = self.command();
+        command
+            .args(["display-message", "-p", "-t"])
+            .arg(pane)
+            .arg("#{session_name}|#{pane_dead}");
+        let output = command.output()?;
+        if !output.status.success() {
+            return if output.status.code() == Some(1) {
+                Ok(false)
+            } else {
+                Err(command_error("tmux", &output))
+            };
+        }
+
+        let detail = text(&output.stdout);
+        let mut fields = detail.trim().split('|');
+        let (Some(session), Some(pane_dead)) = (fields.next(), fields.next()) else {
+            return Err(ToolError::Message(format!(
+                "tmux pane {pane} returned invalid liveness metadata"
+            )));
+        };
+        if fields.next().is_some() {
+            return Err(ToolError::Message(format!(
+                "tmux pane {pane} returned invalid liveness metadata"
+            )));
+        }
+        if session != name {
+            return Ok(false);
+        }
+        match pane_dead {
+            "0" => Ok(true),
+            "1" => Ok(false),
+            _ => Err(ToolError::Message(format!(
+                "tmux pane {pane} returned an invalid liveness value"
+            ))),
+        }
+    }
+
+    fn deliver_prompt(&self, name: &str, message: &str) -> Result<()> {
+        let pane = self
+            .agent_pane(name)?
+            .ok_or_else(|| ToolError::Message(format!("tmux session {name} has no agent pane")))?;
+        let target = self.pane_target(name, &pane)?;
+        self.deliver_prompt_at(&target, message)
+    }
+
+    fn deliver_prompt_to(&self, name: &str, message: &str, pane: Option<&str>) -> Result<()> {
+        let Some(pane) = pane else {
+            return self.deliver_prompt(name, message);
+        };
+        let target = self.pane_target(name, pane)?;
+        self.deliver_prompt_at(&target, message)
     }
 
     fn kill_session(&self, name: &str) -> Result<()> {
@@ -813,6 +1196,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         let repo_id = self.git.repository_id(&root)?;
         let project_name = self.git.repository_name(&root)?;
         let target = self.paths.worktree_path(&repo_id, name);
+        self.paths.validate_worktree_path(&repo_id, name)?;
         let existing = self.find_worktree(&root, &target)?;
 
         if target.exists() && existing.is_none() {
@@ -897,17 +1281,58 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             worktree_name: name.to_owned(),
             agent_name: agent_name.clone(),
         };
-        let state = SessionState {
+        let mut state = SessionState {
             repo_id: repo_id.clone(),
             worktree_name: name.to_owned(),
             worktree_path: target.clone(),
             branch: name.to_owned(),
             session: session.clone(),
             agent: agent_name,
+            pane: None,
         };
         write_session_state(&state_path, &state)?;
-        if let Err(error) = self.sessions.create_session(&session, &target, &agent) {
+        let pane = match self
+            .sessions
+            .create_session_with_pane(&session, &target, &agent)
+        {
+            Ok(pane) => pane,
+            Err(error) => {
+                self.cleanup_failed_session(&state_path, &session);
+                return Err(error);
+            }
+        };
+
+        let live = match self.sessions.has_session(&session) {
+            Ok(live) => live,
+            Err(error) => {
+                self.cleanup_failed_session(&state_path, &session);
+                return Err(error);
+            }
+        };
+        if !live {
             let _ = fs::remove_file(&state_path);
+            return Err(ToolError::Message(format!(
+                "agent session {session} exited before it could be attached"
+            )));
+        }
+        if let Some(pane) = pane.as_deref() {
+            let alive = match self.sessions.pane_is_alive(&session, pane) {
+                Ok(alive) => alive,
+                Err(error) => {
+                    self.cleanup_failed_session(&state_path, &session);
+                    return Err(error);
+                }
+            };
+            if !alive {
+                self.cleanup_failed_session(&state_path, &session);
+                return Err(ToolError::Message(format!(
+                    "agent pane {pane} in session {session} is dead"
+                )));
+            }
+        }
+        state.pane = pane;
+        if let Err(error) = write_session_state(&state_path, &state) {
+            self.cleanup_failed_session(&state_path, &session);
             return Err(error);
         }
         if !self.sessions.has_session(&session)? {
@@ -944,11 +1369,81 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
         if !self.sessions.has_session(&session)? {
             fs::remove_file(&state_path)?;
+
             return Err(ToolError::Message(format!(
                 "agent session {session} exited before it could be attached"
             )));
         }
         self.sessions.attach(&session)
+    }
+
+    pub fn prompt(&self, cwd: &Path, name: &str, message: &str) -> Result<()> {
+        self.sessions.ensure_available()?;
+        validate_worktree_name(name)?;
+
+        let root = self.git.repository_root(cwd)?;
+        let repo_id = self.git.repository_id(&root)?;
+        let target = self.paths.worktree_path(&repo_id, name);
+        self.paths.validate_worktree_path(&repo_id, name)?;
+        if !target.is_dir() {
+            return Err(ToolError::Message(format!(
+                "managed worktree does not exist: {name}"
+            )));
+        }
+        let worktree = self.find_worktree(&root, &target)?.ok_or_else(|| {
+            ToolError::Message(format!("managed worktree does not exist: {name}"))
+        })?;
+        if worktree.branch.as_deref() != Some(name) {
+            return Err(ToolError::Message(format!(
+                "managed worktree {name} is not attached to its expected branch"
+            )));
+        }
+
+        let session = session_name(&repo_id, name);
+        let state_path = self.paths.session_state_path(&repo_id, name);
+        let live = self.sessions.has_session(&session)?;
+        if !state_path.is_file() {
+            return Err(if live {
+                ToolError::Message(format!(
+                    "agent session {session} exists but is not managed by david"
+                ))
+            } else {
+                ToolError::Message(format!(
+                    "managed agent session {session} is missing or not running"
+                ))
+            });
+        }
+
+        let state = read_session_state(&state_path)?;
+        if !state.matches(&repo_id, name, &target, &session) {
+            return Err(ToolError::Message(format!(
+                "agent session {session} metadata does not match the requested worktree"
+            )));
+        }
+        if !live {
+            return Err(ToolError::Message(format!(
+                "managed agent session {session} is not running"
+            )));
+        }
+
+        let pane = match state.pane {
+            Some(pane) => Some(pane),
+            None => self.sessions.agent_pane(&session)?,
+        };
+        if let Some(pane) = pane.as_deref()
+            && !self.sessions.pane_is_alive(&session, pane)?
+        {
+            return Err(ToolError::Message(format!(
+                "agent pane {pane} in session {session} is dead"
+            )));
+        }
+        self.sessions
+            .deliver_prompt_to(&session, message, pane.as_deref())
+            .map_err(|error| {
+                ToolError::Message(format!(
+                    "failed to deliver prompt to agent session {session}: {error}"
+                ))
+            })
     }
 
     pub fn list<W: Write>(&self, cwd: &Path, output: &mut W) -> Result<()> {
@@ -969,6 +1464,9 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 continue;
             }
             let name = relative.to_string_lossy().to_string();
+            if self.paths.validate_worktree_path(&repo_id, &name).is_err() {
+                continue;
+            }
             let session = session_name(&repo_id, &name);
             let state_path = self.paths.session_state_path(&repo_id, &name);
             let agent = if state_path.is_file() {
@@ -979,7 +1477,24 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                             "session metadata does not match managed worktree {name}"
                         )));
                     }
-                    state.agent
+                    let pane_alive = if let Some(pane) = state.pane.as_deref() {
+                        self.sessions
+                            .pane_is_alive(&session, pane)
+                            .unwrap_or_default()
+                    } else {
+                        match self.sessions.agent_pane(&session) {
+                            Ok(Some(pane)) => self
+                                .sessions
+                                .pane_is_alive(&session, &pane)
+                                .unwrap_or_default(),
+                            Ok(None) | Err(_) => false,
+                        }
+                    };
+                    if pane_alive {
+                        state.agent
+                    } else {
+                        "-".to_owned()
+                    }
                 } else {
                     "-".to_owned()
                 }
@@ -1007,6 +1522,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         let root = self.git.repository_root(cwd)?;
         let repo_id = self.git.repository_id(&root)?;
         let target = self.paths.worktree_path(&repo_id, name);
+        self.paths.validate_worktree_path(&repo_id, name)?;
         let worktree = self.find_worktree(&root, &target)?.ok_or_else(|| {
             ToolError::Message(format!("managed worktree does not exist: {name}"))
         })?;
@@ -1052,6 +1568,11 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             fs::remove_file(state_path)?;
         }
         Ok(())
+    }
+
+    fn cleanup_failed_session(&self, state_path: &Path, session: &str) {
+        let _ = fs::remove_file(state_path);
+        let _ = self.sessions.kill_session(session);
     }
 
     fn find_worktree(&self, root: &Path, target: &Path) -> Result<Option<Worktree>> {
@@ -1137,6 +1658,16 @@ fn status_left_length(metadata: &SessionMetadata) -> String {
     length.to_string()
 }
 
+static NEXT_PROMPT_BUFFER_ID: AtomicU64 = AtomicU64::new(0);
+
+fn prompt_buffer_name() -> String {
+    format!(
+        "david-prompt-{}-{}",
+        std::process::id(),
+        NEXT_PROMPT_BUFFER_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn write_config(path: &Path, config: &Config) -> Result<()> {
     let temporary = path.with_file_name(format!(
         ".{}.tmp-{}",
@@ -1180,7 +1711,21 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
                 path.display()
             )));
         };
-        values.insert(key, value.to_owned());
+        if !matches!(
+            key,
+            "repo_id" | "worktree_name" | "worktree_path" | "branch" | "session" | "agent" | "pane"
+        ) {
+            return Err(ToolError::Message(format!(
+                "session metadata contains unknown field {key}: {}",
+                path.display()
+            )));
+        }
+        if values.insert(key, value.to_owned()).is_some() {
+            return Err(ToolError::Message(format!(
+                "session metadata contains duplicate field {key}: {}",
+                path.display()
+            )));
+        }
     }
     let take = |key: &str| {
         values.get(key).cloned().ok_or_else(|| {
@@ -1190,20 +1735,72 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
             ))
         })
     };
+    let agent = take("agent")?;
+    if agent.trim().is_empty() || agent.contains('\n') || agent.contains('\r') {
+        return Err(ToolError::Message(format!(
+            "session metadata has an invalid agent: {}",
+            path.display()
+        )));
+    }
+    let pane = values.get("pane").cloned();
+    if let Some(pane) = &pane
+        && !valid_pane_id(pane)
+    {
+        return Err(ToolError::Message(format!(
+            "session metadata has an invalid pane: {}",
+            path.display()
+        )));
+    }
     Ok(SessionState {
         repo_id: take("repo_id")?,
         worktree_name: take("worktree_name")?,
         worktree_path: PathBuf::from(take("worktree_path")?),
         branch: take("branch")?,
         session: take("session")?,
-        agent: take("agent")?,
+        agent,
+        pane,
     })
+}
+
+fn canonicalize_with_missing(path: &Path) -> io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut missing = Vec::new();
+
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(_) => {
+                let mut canonical = fs::canonicalize(&current)?;
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(file_name) = current.file_name() else {
+                    return Err(error);
+                };
+                missing.push(file_name.to_os_string());
+                current = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(|parent| parent.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn same_path(first: &Path, second: &Path) -> bool {
     let first = fs::canonicalize(first).unwrap_or_else(|_| first.to_path_buf());
     let second = fs::canonicalize(second).unwrap_or_else(|_| second.to_path_buf());
     first == second
+}
+
+fn valid_pane_id(value: &str) -> bool {
+    value
+        .strip_prefix('%')
+        .is_some_and(|id| !id.is_empty() && id.chars().all(|character| character.is_ascii_digit()))
 }
 
 fn slug(value: &str) -> String {
@@ -1272,6 +1869,8 @@ mod tests {
         killed: Vec<String>,
         configure_error: Option<String>,
         kill_error: Option<String>,
+        deliveries: Vec<(String, String)>,
+        prompt_error: Option<String>,
     }
 
     impl SessionBackend for FakeSessions {
@@ -1299,8 +1898,21 @@ mod tests {
             Ok(())
         }
 
+        fn agent_pane(&self, _name: &str) -> Result<Option<String>> {
+            Ok(Some("%0".to_owned()))
+        }
+
         fn attach(&self, name: &str) -> Result<()> {
             self.state.borrow_mut().attached.push(name.to_owned());
+            Ok(())
+        }
+
+        fn deliver_prompt(&self, name: &str, message: &str) -> Result<()> {
+            let mut state = self.state.borrow_mut();
+            if let Some(error) = state.prompt_error.as_ref() {
+                return Err(ToolError::Message(error.clone()));
+            }
+            state.deliveries.push((name.to_owned(), message.to_owned()));
             Ok(())
         }
 
@@ -1312,6 +1924,119 @@ mod tests {
             state.live.remove(name);
             state.killed.push(name.to_owned());
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PaneSessions {
+        state: Rc<RefCell<PaneSessionState>>,
+    }
+
+    #[derive(Default)]
+    struct PaneSessionState {
+        live: BTreeSet<String>,
+        pane: Option<String>,
+        pane_error: Option<String>,
+        pane_dead: bool,
+        deliveries: Vec<(String, String, Option<String>)>,
+        killed: Vec<String>,
+    }
+
+    impl SessionBackend for PaneSessions {
+        fn ensure_available(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn has_session(&self, name: &str) -> Result<bool> {
+            Ok(self.state.borrow().live.contains(name))
+        }
+
+        fn create_session(&self, name: &str, _cwd: &Path, _agent: &Agent) -> Result<()> {
+            self.state.borrow_mut().live.insert(name.to_owned());
+            Ok(())
+        }
+
+        fn agent_pane(&self, _name: &str) -> Result<Option<String>> {
+            let state = self.state.borrow();
+            if let Some(error) = state.pane_error.as_ref() {
+                return Err(ToolError::Message(error.clone()));
+            }
+            Ok(state.pane.clone())
+        }
+
+        fn pane_is_alive(&self, _name: &str, _pane: &str) -> Result<bool> {
+            Ok(!self.state.borrow().pane_dead)
+        }
+
+        fn attach(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn deliver_prompt_to(&self, name: &str, message: &str, pane: Option<&str>) -> Result<()> {
+            self.state.borrow_mut().deliveries.push((
+                name.to_owned(),
+                message.to_owned(),
+                pane.map(str::to_owned),
+            ));
+            Ok(())
+        }
+
+        fn kill_session(&self, name: &str) -> Result<()> {
+            let mut state = self.state.borrow_mut();
+            state.live.remove(name);
+            state.killed.push(name.to_owned());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct AtomicPaneSessions {
+        inner: PaneSessions,
+    }
+
+    impl SessionBackend for AtomicPaneSessions {
+        fn ensure_available(&self) -> Result<()> {
+            self.inner.ensure_available()
+        }
+
+        fn has_session(&self, name: &str) -> Result<bool> {
+            self.inner.has_session(name)
+        }
+
+        fn create_session(&self, name: &str, cwd: &Path, agent: &Agent) -> Result<()> {
+            self.inner.create_session(name, cwd, agent)
+        }
+
+        fn create_session_with_pane(
+            &self,
+            name: &str,
+            cwd: &Path,
+            agent: &Agent,
+        ) -> Result<Option<String>> {
+            self.inner.create_session(name, cwd, agent)?;
+            Ok(Some("%99".to_owned()))
+        }
+
+        fn agent_pane(&self, _name: &str) -> Result<Option<String>> {
+            Err(ToolError::Message(
+                "agent pane was queried after session creation".to_owned(),
+            ))
+        }
+
+        fn pane_is_alive(&self, name: &str, pane: &str) -> Result<bool> {
+            self.inner.pane_is_alive(name, pane)
+        }
+
+        fn attach(&self, name: &str) -> Result<()> {
+            self.inner.attach(name)
+        }
+
+        fn deliver_prompt_to(&self, name: &str, message: &str, pane: Option<&str>) -> Result<()> {
+            self.inner.deliver_prompt_to(name, message, pane)
+        }
+
+        fn kill_session(&self, name: &str) -> Result<()> {
+            self.inner.kill_session(name)
         }
     }
 
@@ -1414,6 +2139,35 @@ mod tests {
     #[test]
     fn names_sessions_in_david_namespace() {
         assert!(session_name("repo", "worktree").starts_with("david-"));
+    }
+
+    #[test]
+    fn session_state_round_trips_pane_and_reads_legacy_state_without_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.state");
+        let state = SessionState {
+            repo_id: "repo".to_owned(),
+            worktree_name: "feature".to_owned(),
+            worktree_path: PathBuf::from("/tmp/feature"),
+            branch: "feature".to_owned(),
+            session: "david-repo-feature".to_owned(),
+            agent: "test".to_owned(),
+            pane: Some("%42".to_owned()),
+        };
+
+        write_session_state(&path, &state).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("pane=%42\n"));
+        assert_eq!(read_session_state(&path).unwrap(), state);
+
+        let legacy = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("pane="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, legacy).unwrap();
+        assert_eq!(read_session_state(&path).unwrap().pane, None);
     }
 
     #[test]
@@ -1531,6 +2285,177 @@ mod tests {
         assert_eq!(sessions.state.borrow().configured.len(), 2);
         assert_eq!(sessions.state.borrow().configured[1].1, expected);
         assert_eq!(sessions.state.borrow().attached.len(), 2);
+    }
+
+    #[test]
+    fn run_uses_the_atomically_returned_agent_pane_without_querying_panes() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = AtomicPaneSessions::default();
+        let app = App::with_picker(paths.clone(), sessions.clone(), FirstAgentPicker);
+
+        app.run(repo.path(), "feature").unwrap();
+
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        assert!(
+            fs::read_to_string(state_path)
+                .unwrap()
+                .contains("pane=%99\n")
+        );
+
+        app.prompt(repo.path(), "feature", "message").unwrap();
+        assert_eq!(
+            sessions.inner.state.borrow().deliveries,
+            vec![(
+                session_name(&repo_id, "feature"),
+                "message".to_owned(),
+                Some("%99".to_owned())
+            )]
+        );
+    }
+
+    #[test]
+    fn run_persists_agent_pane_and_prompt_uses_the_persisted_target() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = PaneSessions::default();
+        sessions.state.borrow_mut().pane = Some("%42".to_owned());
+        let app = App::with_picker(paths.clone(), sessions.clone(), FirstAgentPicker);
+
+        app.run(repo.path(), "feature").unwrap();
+
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        assert!(
+            fs::read_to_string(state_path)
+                .unwrap()
+                .contains("pane=%42\n")
+        );
+
+        app.prompt(repo.path(), "feature", "message").unwrap();
+        assert_eq!(
+            sessions.state.borrow().deliveries,
+            vec![(
+                session_name(&repo_id, "feature"),
+                "message".to_owned(),
+                Some("%42".to_owned())
+            )]
+        );
+    }
+
+    #[test]
+    fn run_rejects_a_dead_agent_pane() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = PaneSessions::default();
+        {
+            let mut state = sessions.state.borrow_mut();
+            state.pane = Some("%42".to_owned());
+            state.pane_dead = true;
+        }
+        let app = App::with_picker(paths.clone(), sessions.clone(), FirstAgentPicker);
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+
+        assert!(error.to_string().contains("agent pane"));
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        assert!(!paths.session_state_path(&repo_id, "feature").exists());
+        assert!(sessions.state.borrow().live.is_empty());
+        assert!(sessions.state.borrow().killed.len() == 1);
+    }
+
+    #[test]
+    fn prompt_rejects_a_dead_persisted_pane() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = PaneSessions::default();
+        sessions.state.borrow_mut().pane = Some("%42".to_owned());
+        let app = App::with_picker(paths, sessions.clone(), FirstAgentPicker);
+
+        app.run(repo.path(), "feature").unwrap();
+        sessions.state.borrow_mut().pane_dead = true;
+
+        let error = app.prompt(repo.path(), "feature", "message").unwrap_err();
+
+        assert!(error.to_string().contains("dead"));
+        assert!(sessions.state.borrow().deliveries.is_empty());
+    }
+
+    #[test]
+    fn run_cleans_up_state_and_session_when_agent_pane_query_fails() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = PaneSessions::default();
+        sessions.state.borrow_mut().pane_error = Some("pane unavailable".to_owned());
+        let app = App::with_picker(paths.clone(), sessions.clone(), FirstAgentPicker);
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+
+        assert!(error.to_string().contains("pane unavailable"));
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        assert!(!paths.session_state_path(&repo_id, "feature").exists());
+        assert!(sessions.state.borrow().live.is_empty());
+        assert_eq!(
+            sessions.state.borrow().killed,
+            vec![session_name(&repo_id, "feature")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_rejects_a_symlinked_worktree_parent_escape_before_creating_or_starting_session() {
+        use std::os::unix::fs::symlink;
+
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        fs::create_dir_all(&paths.worktrees).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), paths.repository_worktrees(&repo_id)).unwrap();
+        let sessions = FakeSessions::default();
+        let app = test_app(paths, sessions.clone());
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+
+        assert!(error.to_string().contains("escapes the managed directory"));
+        assert!(sessions.state.borrow().created.is_empty());
+        assert!(!outside.path().join("feature").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_rejects_a_symlinked_worktree_parent_escape_before_stopping_session() {
+        use std::os::unix::fs::symlink;
+
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let base = paths.repository_worktrees(&repo_id);
+        let target = paths.worktree_path(&repo_id, worktree);
+        let outside = tempfile::tempdir().unwrap();
+        let moved = outside.path().join(worktree);
+        fs::rename(&target, &moved).unwrap();
+        fs::remove_dir(&base).unwrap();
+        symlink(outside.path(), &base).unwrap();
+
+        let error = app.remove(repo.path(), worktree, true).unwrap_err();
+
+        assert!(error.to_string().contains("escapes the managed directory"));
+        assert!(sessions.state.borrow().killed.is_empty());
+        assert!(moved.is_dir());
     }
 
     #[test]
@@ -1843,5 +2768,623 @@ mod tests {
                 .iter()
                 .all(|table| !keys.contains(table))
         );
+    }
+
+    #[test]
+    fn list_reports_a_dead_persisted_pane_as_inactive() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = PaneSessions::default();
+        sessions.state.borrow_mut().pane = Some("%42".to_owned());
+        let app = App::with_picker(paths, sessions.clone(), FirstAgentPicker);
+
+        app.run(repo.path(), "feature").unwrap();
+        sessions.state.borrow_mut().pane_dead = true;
+
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("feature\tfeature\t-\t"));
+        assert!(!output.contains("feature\tfeature\ttest\t"));
+    }
+
+    #[test]
+    fn list_preserves_active_status_for_a_live_legacy_session() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        let legacy = fs::read_to_string(&state_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("pane="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(state_path, legacy).unwrap();
+
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("feature\tfeature\ttest\t")
+        );
+    }
+
+    #[test]
+    fn prompt_forwards_exact_message_without_loading_config_or_attaching() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let attached = sessions.state.borrow().attached.len();
+        let created = sessions.state.borrow().created.len();
+        fs::remove_file(paths.config_path()).unwrap();
+
+        let message = "-literal 'quotes' $() 😀\tline one\nline two";
+        app.prompt(repo.path(), worktree, message).unwrap();
+
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        assert_eq!(
+            sessions.state.borrow().deliveries,
+            vec![(session_name(&repo_id, worktree), message.to_owned())]
+        );
+        assert_eq!(sessions.state.borrow().attached.len(), attached);
+        assert_eq!(sessions.state.borrow().created.len(), created);
+    }
+
+    #[test]
+    fn prompt_rejects_unknown_worktree_and_does_not_deliver() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = DavidPaths::from_home(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths, sessions.clone());
+
+        let error = app.prompt(repo.path(), "unknown", "message").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed worktree does not exist")
+        );
+        assert!(sessions.state.borrow().deliveries.is_empty());
+    }
+
+    #[test]
+    fn prompt_rejects_dead_session() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths, sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        sessions
+            .state
+            .borrow_mut()
+            .live
+            .remove(&session_name(&repo_id, worktree));
+
+        let error = app.prompt(repo.path(), worktree, "message").unwrap_err();
+
+        assert!(error.to_string().contains("not running"));
+        assert!(sessions.state.borrow().deliveries.is_empty());
+    }
+
+    #[test]
+    fn prompt_rejects_a_deleted_worktree_checkout() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, worktree);
+        fs::remove_dir_all(&target).unwrap();
+
+        let error = app.prompt(repo.path(), worktree, "message").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed worktree does not exist")
+        );
+        assert!(sessions.state.borrow().deliveries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_rejects_a_worktree_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, worktree);
+        let outside = tempfile::tempdir().unwrap();
+        let moved = outside.path().join("checkout");
+        fs::rename(&target, &moved).unwrap();
+        symlink(&moved, &target).unwrap();
+
+        let error = app.prompt(repo.path(), worktree, "message").unwrap_err();
+
+        assert!(error.to_string().contains("escapes the managed directory"));
+        assert!(sessions.state.borrow().deliveries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_omits_a_registered_worktree_that_resolves_outside_the_managed_directory() {
+        use std::os::unix::fs::symlink;
+
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, worktree);
+        let outside = tempfile::tempdir().unwrap();
+        let moved = outside.path().join(worktree);
+        fs::rename(&target, &moved).unwrap();
+        symlink(&moved, &target).unwrap();
+
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(!output.contains("feature\tfeature\t"));
+        assert!(output.contains("No managed worktrees."));
+    }
+
+    #[test]
+    fn prompt_rejects_unmanaged_live_session() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        fs::remove_file(paths.session_state_path(&repo_id, worktree)).unwrap();
+
+        let error = app.prompt(repo.path(), worktree, "message").unwrap_err();
+
+        assert!(error.to_string().contains("not managed by david"));
+        assert!(sessions.state.borrow().deliveries.is_empty());
+    }
+
+    #[test]
+    fn prompt_rejects_mismatched_session_metadata() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let state_path = paths.session_state_path(&repo_id, worktree);
+        let state = fs::read_to_string(&state_path).unwrap();
+        fs::write(
+            &state_path,
+            state.replace("worktree_name=feature", "worktree_name=other"),
+        )
+        .unwrap();
+
+        let error = app.prompt(repo.path(), worktree, "message").unwrap_err();
+
+        assert!(error.to_string().contains("metadata does not match"));
+        assert!(sessions.state.borrow().deliveries.is_empty());
+    }
+
+    #[test]
+    fn prompt_reports_backend_delivery_failure_without_attach_or_create() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths, sessions.clone());
+        let worktree = "feature";
+
+        app.run(repo.path(), worktree).unwrap();
+        let attached = sessions.state.borrow().attached.len();
+        let created = sessions.state.borrow().created.len();
+        sessions.state.borrow_mut().prompt_error = Some("transport unavailable".to_owned());
+
+        let error = app.prompt(repo.path(), worktree, "message").unwrap_err();
+
+        assert!(error.to_string().contains("transport unavailable"));
+        assert!(sessions.state.borrow().deliveries.is_empty());
+        assert_eq!(sessions.state.borrow().attached.len(), attached);
+        assert_eq!(sessions.state.borrow().created.len(), created);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_prompt_uses_exact_bytes_and_targeted_buffer_sequence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("fake-tmux");
+        fs::write(
+            &program,
+            "#!/bin/sh\ncase \" $* \" in\n  *\" list-panes \"*) printf '%s\\n' '%42|david-managed|0' ;;\n  *\" display-message \"*) printf '%s\\n' 'david-managed|0|0' ;;\n  *) printf '%s\\n' \"$@\" > \"$0.args\"; cat > \"$0.stdin\" ;;\nesac\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let backend = TmuxBackend::new(program.as_os_str().to_owned());
+        let message = "-literal 'quotes' $() 😀\tline one\nline two";
+        backend.deliver_prompt("david-managed", message).unwrap();
+
+        let args_path = program.with_extension("args");
+        let args: Vec<String> = fs::read_to_string(args_path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let load = args.iter().position(|arg| arg == "load-buffer").unwrap();
+        let buffer = args[load + 2].clone();
+        let pane = "=david-managed:0.%42";
+        assert!(buffer.is_ascii());
+        assert_eq!(
+            &args[load..],
+            &[
+                "load-buffer",
+                "-b",
+                buffer.as_str(),
+                "-",
+                ";",
+                "paste-buffer",
+                "-dprS",
+                "-b",
+                buffer.as_str(),
+                "-t",
+                pane,
+                ";",
+                "send-keys",
+                "-t",
+                pane,
+                "Enter",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == message));
+        assert_eq!(
+            fs::read(program.with_extension("stdin")).unwrap(),
+            message.as_bytes()
+        );
+
+        backend.deliver_prompt("david-managed", "").unwrap();
+        let empty_args: Vec<String> = fs::read_to_string(program.with_extension("args"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert!(!empty_args.iter().any(|arg| arg == "load-buffer"));
+        assert!(!empty_args.iter().any(|arg| arg == "paste-buffer"));
+        assert_eq!(
+            empty_args
+                .iter()
+                .filter(|arg| arg.as_str() == "send-keys")
+                .count(),
+            1
+        );
+        assert!(
+            fs::read(program.with_extension("stdin"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_create_session_captures_the_initial_pane_from_new_session_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("fake-tmux");
+        fs::write(
+            &program,
+            "#!/bin/sh\ncount_file=\"$0.count\"\nif [ -f \"$count_file\" ]; then count=$(cat \"$count_file\"); else count=0; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$count_file\"\nprintf '%s\\n' \"$@\" > \"$0.args.$count\"\ncase \" $* \" in\n  *\" new-session \"*) printf '%s\\n' '%42' ;;\n  *\" list-windows \"*) printf '%s\\n' '7' ;;\nesac\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let backend = TmuxBackend::new(program.as_os_str().to_owned());
+        let agent = Agent {
+            command: "echo".to_owned(),
+            args: vec!["ready".to_owned()],
+        };
+        let pane = backend
+            .create_session_with_pane("david-managed", directory.path(), &agent)
+            .unwrap();
+
+        assert_eq!(pane.as_deref(), Some("%42"));
+        let new_args: Vec<String> = fs::read_to_string(program.with_extension("args.1"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let start = new_args
+            .iter()
+            .position(|arg| arg == "new-session")
+            .unwrap();
+        assert_eq!(
+            &new_args[start..start + 7],
+            [
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                "david-managed",
+            ]
+        );
+        assert_eq!(
+            new_args[start + 7..],
+            [
+                "-c".to_owned(),
+                directory.path().to_string_lossy().into_owned(),
+                "--".to_owned(),
+                "echo".to_owned(),
+                "ready".to_owned(),
+            ]
+        );
+
+        let status_args: Vec<String> = fs::read_to_string(program.with_extension("args.3"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let status = status_args
+            .iter()
+            .position(|arg| arg == "set-option")
+            .unwrap();
+        assert_eq!(
+            &status_args[status..],
+            ["set-option", "-t", "=david-managed:7", "status", "off"]
+        );
+        let all_args = (1..=3)
+            .map(|number| fs::read_to_string(program.with_extension(format!("args.{number}"))))
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(!all_args.contains("list-panes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_session_window_target_uses_the_first_window_index_and_exact_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("fake-tmux");
+        fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf '2\\n3\\n'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let backend = TmuxBackend::new(program.as_os_str().to_owned());
+        assert_eq!(
+            backend.session_window_target("david-managed").unwrap(),
+            "=david-managed:2"
+        );
+        let args: Vec<String> = fs::read_to_string(program.with_extension("args"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let target = args.iter().position(|arg| arg == "-t").unwrap();
+        assert_eq!(args[target + 1], "=david-managed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_agent_pane_rejects_a_dead_pane() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("fake-tmux");
+        fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' '%42|david-managed|1'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let backend = TmuxBackend::new(program.as_os_str().to_owned());
+        let error = backend.agent_pane("david-managed").unwrap_err();
+
+        assert!(error.to_string().contains("dead"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_persisted_pane_liveness_rejects_dead_pane_targeting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("fake-tmux");
+        fs::write(
+            &program,
+            "#!/bin/sh\ncase \" $* \" in\n  *window_index*) printf '%s\\n' 'david-managed|2|1' ;;\n  *) printf '%s\\n' 'david-managed|1' ;;\nesac\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let backend = TmuxBackend::new(program.as_os_str().to_owned());
+        assert!(!backend.pane_is_alive("david-managed", "%42").unwrap());
+        let error = backend
+            .deliver_prompt_to("david-managed", "message", Some("%42"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("dead"));
+    }
+
+    #[test]
+    fn missing_tmux_reports_a_prerequisite_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = TmuxBackend::new(directory.path().join("missing-tmux"));
+
+        let error = backend.ensure_available().unwrap_err();
+
+        assert!(error.to_string().contains("tmux is required"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_prompt_reports_transport_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("failing-tmux");
+        fs::write(
+            &program,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' 'delivery failed' >&2\nexit 7\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let backend = TmuxBackend::new(program.as_os_str().to_owned());
+        let error = backend
+            .deliver_prompt_at("=david-managed:0.0", "message")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("delivery failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_backend_delivers_prompt_to_the_managed_agent_pane() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(available) = Command::new("tmux").arg("-V").output() else {
+            return;
+        };
+        if !available.status.success() {
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let reader = directory.path().join("reader.sh");
+        fs::write(
+            &reader,
+            "#!/bin/sh\nstty raw -echo\ndd bs=1 count=\"$1\" of=\"$2\" 2>/dev/null\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&reader).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&reader, permissions).unwrap();
+
+        let output = directory.path().join("received");
+        let message = "literal Enter C-c Space; $() 😀\nsecond line";
+        let expected_len = message.len() + 1;
+        let session = format!(
+            "david-test-{}-{}",
+            std::process::id(),
+            stable_hash("prompt-delivery")
+        );
+        let backend = TmuxBackend::default();
+        let agent = Agent {
+            command: reader.to_string_lossy().into_owned(),
+            args: vec![
+                expected_len.to_string(),
+                output.to_string_lossy().into_owned(),
+            ],
+        };
+
+        backend
+            .create_session(&session, directory.path(), &agent)
+            .unwrap();
+        let pane = backend.agent_pane(&session).unwrap().unwrap();
+        assert!(pane.starts_with('%'));
+        let delivery = backend.deliver_prompt_to(&session, message, Some(&pane));
+
+        let mut received = None;
+        for _ in 0..100 {
+            if output.is_file() && fs::metadata(&output).unwrap().len() == expected_len as u64 {
+                received = Some(fs::read(&output).unwrap());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        backend.kill_session(&session).unwrap();
+        delivery.unwrap();
+
+        let mut expected = message.as_bytes().to_vec();
+        expected.push(b'\n');
+        assert_eq!(received, Some(expected));
+    }
+
+    #[test]
+    fn tmux_backend_manages_a_session_when_tmux_is_available() {
+        let Ok(available) = Command::new("tmux").arg("-V").output() else {
+            return;
+        };
+        if !available.status.success() {
+            return;
+        }
+
+        let session = format!("david-test-{}-{}", std::process::id(), stable_hash("tmux"));
+        let directory = tempfile::tempdir().unwrap();
+        let backend = TmuxBackend::default();
+        let agent = Agent {
+            command: "sleep".to_owned(),
+            args: vec!["30".to_owned()],
+        };
+
+        backend
+            .create_session(&session, directory.path(), &agent)
+            .unwrap();
+        assert!(backend.has_session(&session).unwrap());
+        backend.kill_session(&session).unwrap();
+        assert!(!backend.has_session(&session).unwrap());
     }
 }

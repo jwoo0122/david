@@ -39,10 +39,11 @@ decisions:
     scope: runtime
     decision_type: integration
     summary: Each managed worktree owns at most one persistent tmux agent session
-      that the CLI can attach to.
+      that the CLI can attach to or prompt.
     applies_to:
       - configured agent launch
       - tmux session creation and attach
+      - prompt delivery to a managed agent session
       - list and remove process state
     file: records/runtime/agent-session.md
     constrains: []

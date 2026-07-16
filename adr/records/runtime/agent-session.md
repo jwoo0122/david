@@ -6,8 +6,9 @@ decision_type: integration
 applies_to:
   - configured agent launch
   - tmux session creation and attach
+  - prompt delivery to a managed agent session
   - list and remove process state
-summary: Each managed worktree owns at most one persistent tmux agent session that the CLI can attach to.
+summary: Each managed worktree owns at most one persistent tmux agent session that the CLI can attach to or prompt.
 constrains: []
 depends_on:
   - worktree.storage-and-lifecycle
@@ -30,6 +31,8 @@ The CLI MUST launch each configured agent inside a dedicated tmux session for it
 
 Managed tmux sessions MUST use the `david-<repo-id>-<stable-worktree-hash>` naming prefix so the CLI owns a distinct namespace.
 
+`prompt <worktree> <message>` MUST resolve the same managed worktree and session identity as `run`, require a live session with matching metadata, and deliver the exact received message as literal UTF-8 paste data followed by one `Enter` submission. It MUST NOT create a worktree or session, invoke the agent picker, or attach to tmux. Delivery MUST target the exact managed session and agent pane rather than the caller's current tmux target; prompt data MUST travel through tmux stdin and MUST NOT be interpreted as shell commands or tmux key names.
+
 `list` MUST report only sessions created and tracked by this CLI. Removing a worktree MUST terminate its managed tmux session before removing the checkout.
 
 A managed session MUST provide a session-scoped `Ctrl-]` shortcut that detaches the client without stopping the agent. The shortcut MUST NOT replace root or prefix bindings for unrelated tmux sessions. The standard `Ctrl-b d` tmux sequence MUST remain available as a fallback. While attached, the tmux status line MUST identify the session as `DAVID` and show the project directory name, worktree name, configured agent name, and the detach shortcut.
@@ -43,6 +46,11 @@ A directly exec'd child process is tied to the invoking terminal and cannot prov
 - Agent commands MUST come from the user configuration and MUST run without changing their working directory away from the managed worktree.
 - Session identity MUST be deterministic for a repository/worktree pair and MUST not collide with another managed pair.
 - A live session MUST be preferred over agent selection on `run`.
+- Prompt delivery MUST require a live, metadata-matching managed session and MUST never fall back to agent selection or session creation.
+- Prompt delivery MUST preserve UTF-8 and line feeds, use literal paste semantics, and submit only after the complete message has been pasted.
+- Prompt delivery MUST use an exact session/pane target and MUST not pass the message through a shell or tmux key-name parser.
+- New session metadata MUST retain the created agent pane identity so later prompts do not depend on the caller's current pane.
+- Dead agent panes MUST not receive prompts or be reported as active agents.
 - Stale session metadata MUST never be reported as an active agent.
 - Removal MUST terminate the session before deleting its worktree.
 - The CLI MUST report a clear prerequisite error when tmux is unavailable.
@@ -55,11 +63,11 @@ A directly exec'd child process is tied to the invoking terminal and cannot prov
 
 ## Consequences
 
-Users can detach with the direct `Ctrl-]` shortcut or tmux's standard `Ctrl-b d` sequence and later reattach through `run`. The status line makes the managed-session context and detach action visible without changing the agent command. The CLI must manage session naming, stale state, and forced termination. tmux installation is required on supported systems.
+Users can detach with the direct `Ctrl-]` shortcut or tmux's standard `Ctrl-b d` sequence and later reattach through `run`. The status line makes the managed-session context and detach action visible without changing the agent command. The CLI must manage session naming, stale state, prompt delivery, and forced termination. tmux installation is required on supported systems. Prompt delivery is terminal input transport rather than an agent-level acknowledgement protocol; callers remain responsible for shell quoting before invoking the CLI.
 
 ## Enforcement
 
-Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, stale-session handling, list output, tmux prerequisite failure, removal ordering, and the managed-session status line and detach binding.
+Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, prompt delivery without attach or picker interaction, literal Unicode and multiline prompt content, missing/dead session handling, stale-session handling, list output, tmux prerequisite failure, removal ordering, and the managed-session status line and detach binding.
 
 ## Revisit when
 
