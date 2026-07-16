@@ -33,16 +33,18 @@ This is a hard rebrand. `david` reads `~/.david` and manages `david-...` tmux se
 Create `~/.david/config.toml`:
 
 ```toml
+default_agent = "codex"
+
 [agents.codex]
 command = "codex"
-args = []
+args = ["--profile", "default"]
 
 [agents.claude]
 command = "claude"
 args = []
 ```
 
-Commands are executed directly, not through a shell. Put flags in `args`.
+`default_agent`, when present, must name one of the configured `[agents.<name>]` entries. Commands are executed directly, not through a shell. Put persistent flags in `args`.
 
 ## First-time setup
 
@@ -68,9 +70,34 @@ If the worktree does not exist, `david` creates a new branch from the current `H
 ~/.david/worktrees/<repo-id>/feature-login
 ```
 
-If a live agent session already exists, `david run` attaches to it. Otherwise it shows the configured agent list and starts the selected agent.
+If a live managed session already exists, `run` reuses it without selecting an agent. Otherwise the agent is resolved in this order:
 
-Move focus with the up/down arrow keys and press `Enter` to select an agent.
+1. `--agent <name>` / `-a`
+2. `DAVID_AGENT`
+3. `default_agent` in the config
+4. the sole configured agent
+5. the interactive picker, only when interaction is enabled and both stdin and stderr are terminals
+
+An unknown explicit agent fails without opening the picker. In a non-interactive run, no picker or terminal attachment is attempted; a missing selection fails immediately with exit code `2`. Use `--no-interactive` to enforce this even from a terminal. Use `--detach`/`-d` to create or reuse the session and return without attaching:
+
+```text
+david run -a codex -d feature-login
+DAVID_AGENT=claude david run feature-login -- --model sonnet
+```
+
+Arguments after `--` are appended to the configured `args` and passed as literal argv values, without shell interpretation:
+
+```text
+david run -a codex feature-login -- --model gpt-5.6
+```
+
+Attach explicitly only to an existing managed session:
+
+```text
+david attach feature-login
+```
+
+`attach` never creates a worktree or session, selects an agent, or starts a process. During an in-progress rebase, `run` and `attach` still require the rebase metadata to identify the expected worktree branch and a matching live managed session with a live agent pane; arbitrary detached, wrong-branch, or dead-pane sessions are rejected.
 
 Send a prompt to an existing live managed agent session:
 
