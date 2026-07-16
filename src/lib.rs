@@ -12,7 +12,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::{
+    os::fd::AsRawFd,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ToolError>;
@@ -21,6 +24,12 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 pub enum ToolError {
     #[error("{0}")]
     Message(String),
+    #[error("agent {name:?} is not configured")]
+    UnknownAgent { name: String },
+    #[error(
+        "non-interactive run requires --agent, DAVID_AGENT, default_agent, or exactly one configured agent"
+    )]
+    AgentSelectionUnavailable,
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("configuration parse error: {0}")]
@@ -29,6 +38,15 @@ pub enum ToolError {
     ConfigSerialize(#[from] toml::ser::Error),
     #[error("{program} failed: {detail}")]
     Command { program: String, detail: String },
+}
+
+impl ToolError {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::UnknownAgent { .. } | Self::AgentSelectionUnavailable => 2,
+            _ => 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +111,15 @@ impl DavidPaths {
             .join(format!("{}-{}.state", repo_id, stable_hash(name)))
     }
 
+    fn worktree_lock_path(&self, repo_id: &str, name: &str) -> PathBuf {
+        self.sessions
+            .join(format!("{}-{}.lock", repo_id, stable_hash(name)))
+    }
+
+    fn lock_worktree(&self, repo_id: &str, name: &str) -> Result<WorktreeLock> {
+        WorktreeLock::acquire(&self.worktree_lock_path(repo_id, name))
+    }
+
     fn validate_worktree_path(&self, repo_id: &str, name: &str) -> Result<()> {
         let path_error = || {
             ToolError::Message(format!(
@@ -114,6 +141,38 @@ impl DavidPaths {
     }
 }
 
+struct WorktreeLock {
+    file: fs::File,
+}
+
+impl WorktreeLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        #[cfg(unix)]
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(ToolError::Io(io::Error::last_os_error()));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for WorktreeLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Agent {
     pub command: String,
@@ -123,6 +182,8 @@ pub struct Agent {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
+    #[serde(default)]
+    pub default_agent: Option<String>,
     #[serde(default)]
     pub agents: BTreeMap<String, Agent>,
 }
@@ -217,6 +278,13 @@ impl Config {
                     "agent {name:?} must define a non-empty single-line command"
                 )));
             }
+        }
+        if let Some(default_agent) = &self.default_agent
+            && !self.agents.contains_key(default_agent)
+        {
+            return Err(ToolError::Message(format!(
+                "default_agent {default_agent:?} does not reference a configured agent"
+            )));
         }
         Ok(())
     }
@@ -318,6 +386,59 @@ impl AgentPicker for TerminalAgentPicker {
     }
 }
 
+fn resolve_agent<P: AgentPicker>(
+    config: &Config,
+    explicit: Option<&str>,
+    environment: Option<&str>,
+    interactive: bool,
+    picker: &P,
+) -> Result<(String, Agent)> {
+    let requested = explicit.or_else(|| environment.filter(|name| !name.is_empty()));
+    let requested = requested.or(config.default_agent.as_deref());
+    if let Some(name) = requested {
+        return config
+            .agents
+            .get(name)
+            .cloned()
+            .map(|agent| (name.to_owned(), agent))
+            .ok_or_else(|| ToolError::UnknownAgent {
+                name: name.to_owned(),
+            });
+    }
+    if config.agents.len() == 1 {
+        return config
+            .agents
+            .iter()
+            .next()
+            .map(|(name, agent)| (name.clone(), agent.clone()))
+            .ok_or(ToolError::AgentSelectionUnavailable);
+    }
+    if interactive {
+        picker.pick(config)
+    } else {
+        Err(ToolError::AgentSelectionUnavailable)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOptions {
+    pub agent: Option<String>,
+    pub agent_args: Vec<String>,
+    pub interactive: bool,
+    pub attach: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            agent_args: Vec::new(),
+            interactive: true,
+            attach: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Git {
     program: OsString,
@@ -400,10 +521,58 @@ impl Git {
             })
     }
 
-    fn current_head(&self, root: &Path) -> Result<()> {
+    fn git_dir(&self, worktree: &Path) -> Result<PathBuf> {
+        let mut command = self.command(worktree);
+        command.args(["rev-parse", "--git-dir"]);
+        let output = self.output(command)?;
+        let raw = PathBuf::from(text(&output.stdout).trim());
+        let git_dir = if raw.is_absolute() {
+            raw
+        } else {
+            worktree.join(raw)
+        };
+        fs::canonicalize(git_dir).map_err(ToolError::Io)
+    }
+
+    fn rebase_matches_branch(&self, worktree: &Path, name: &str) -> Result<bool> {
+        let git_dir = self.git_dir(worktree)?;
+        let expected = format!("refs/heads/{name}");
+        let mut active_rebases = 0;
+        for (directory, is_apply_backend) in [("rebase-merge", false), ("rebase-apply", true)] {
+            let operation = git_dir.join(directory);
+            if !operation.is_dir() {
+                continue;
+            }
+            if is_apply_backend && operation.join("applying").is_file() {
+                continue;
+            }
+            active_rebases += 1;
+            if active_rebases > 1 {
+                return Ok(false);
+            }
+            let head_name = match fs::read_to_string(operation.join("head-name")) {
+                Ok(head_name) => head_name,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(ToolError::Io(error)),
+            };
+            if head_name.trim() != expected {
+                return Ok(false);
+            }
+        }
+        Ok(active_rebases == 1)
+    }
+
+    fn current_head(&self, root: &Path) -> Result<String> {
         let mut command = self.command(root);
         command.args(["rev-parse", "--verify", "HEAD"]);
-        self.output(command).map(|_| ())
+        let output = self.output(command)?;
+        let head = text(&output.stdout).trim().to_owned();
+        if head.is_empty() {
+            return Err(ToolError::Message(
+                "source repository returned an empty HEAD".to_owned(),
+            ));
+        }
+        Ok(head)
     }
 
     fn source_is_dirty(&self, root: &Path) -> Result<bool> {
@@ -425,12 +594,12 @@ impl Git {
         Ok(parse_worktree_list(&text(&output.stdout)))
     }
 
-    fn add_worktree(&self, root: &Path, name: &str, path: &Path) -> Result<()> {
+    fn add_worktree(&self, root: &Path, name: &str, path: &Path, head: &str) -> Result<()> {
         let mut command = self.command(root);
         command
             .args(["worktree", "add", "-b", name])
             .arg(path)
-            .arg("HEAD");
+            .arg(head);
         self.output(command).map(|_| ())
     }
 
@@ -459,9 +628,25 @@ impl Git {
         ))
     }
 
-    fn delete_branch(&self, root: &Path, name: &str) -> Result<()> {
+    fn branch_head(&self, root: &Path, name: &str) -> Result<String> {
         let mut command = self.command(root);
-        command.args(["branch", "-D", "--", name]);
+        command
+            .args(["rev-parse", "--verify"])
+            .arg(format!("refs/heads/{name}"));
+        let output = self.output(command)?;
+        let head = text(&output.stdout).trim().to_owned();
+        if head.is_empty() {
+            return Err(ToolError::Message(format!("branch {name} has no commit")));
+        }
+        Ok(head)
+    }
+
+    fn delete_branch(&self, root: &Path, name: &str, expected_head: &str) -> Result<()> {
+        let mut command = self.command(root);
+        command
+            .args(["update-ref", "-d"])
+            .arg(format!("refs/heads/{name}"))
+            .arg(expected_head);
         self.output(command).map(|_| ())
     }
 
@@ -529,7 +714,15 @@ pub trait SessionBackend {
         agent: &Agent,
     ) -> Result<Option<String>> {
         self.create_session(name, cwd, agent)?;
-        self.agent_pane(name)
+        match self.agent_pane(name) {
+            Ok(pane) => Ok(pane),
+            Err(error) => match self.kill_session(name) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(ToolError::Message(format!(
+                    "{error}; failed to clean up agent session: {cleanup_error}"
+                ))),
+            },
+        }
     }
     fn agent_pane(&self, _name: &str) -> Result<Option<String>> {
         Ok(None)
@@ -540,7 +733,13 @@ pub trait SessionBackend {
     fn configure_session(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
         Ok(())
     }
+    fn validate_session_metadata(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
+        Ok(())
+    }
     fn attach(&self, name: &str) -> Result<()>;
+    fn clear_session_affordances(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
     fn deliver_prompt(&self, _name: &str, _message: &str) -> Result<()> {
         Err(ToolError::Message(
             "session backend does not support prompt delivery".to_owned(),
@@ -632,6 +831,27 @@ impl TmuxBackend {
             .arg(option);
         let output = self.output(command)?;
         Ok(text(&output.stdout).trim().to_owned())
+    }
+
+    fn show_option_exact(&self, session: &str, option: &str) -> Result<String> {
+        let target = self.session_id(session)?;
+        let mut command = self.command();
+        command
+            .args(["show-option", "-v", "-t"])
+            .arg(target)
+            .arg(option);
+        let output = self.output(command)?;
+        Ok(text(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned())
+    }
+
+    fn session_metadata(&self, session: &str) -> Result<SessionMetadata> {
+        Ok(SessionMetadata {
+            project_name: self.show_option_exact(session, "@david-project")?,
+            worktree_name: self.show_option_exact(session, "@david-worktree")?,
+            agent_name: self.show_option_exact(session, "@david-agent")?,
+        })
     }
 
     fn configure_key_table(&self, session: &str) -> Result<()> {
@@ -1019,12 +1239,26 @@ impl SessionBackend for TmuxBackend {
         self.set_option(name, "status-right-length", "32")
     }
 
+    fn validate_session_metadata(&self, name: &str, expected: &SessionMetadata) -> Result<()> {
+        let actual = self.session_metadata(name).map_err(|error| {
+            ToolError::Message(format!(
+                "tmux session {name} is missing david ownership metadata: {error}"
+            ))
+        })?;
+        if actual != *expected {
+            return Err(ToolError::Message(format!(
+                "tmux session {name} metadata does not match the requested worktree"
+            )));
+        }
+        Ok(())
+    }
+
     fn attach(&self, name: &str) -> Result<()> {
         let target = self.session_id(name)?;
         let mut command = self.command();
         command.args(["attach-session", "-t"]).arg(target);
         let status = command.status()?;
-        if status.success() || !self.has_session(name)? {
+        if status.success() {
             Ok(())
         } else {
             Err(self.status_error(status))
@@ -1071,16 +1305,10 @@ impl SessionBackend for TmuxBackend {
                 "tmux session {name} returned an invalid pane id"
             )));
         }
-        match pane_dead {
-            "0" => {}
-            "1" => {
-                return Err(ToolError::Message(format!("tmux pane {pane} is dead")));
-            }
-            _ => {
-                return Err(ToolError::Message(format!(
-                    "tmux session {name} returned an invalid pane liveness value"
-                )));
-            }
+        if !matches!(pane_dead, "0" | "1") {
+            return Err(ToolError::Message(format!(
+                "tmux session {name} returned an invalid pane liveness value"
+            )));
         }
         Ok(Some(pane.to_owned()))
     }
@@ -1145,6 +1373,10 @@ impl SessionBackend for TmuxBackend {
         self.deliver_prompt_at(&target, message)
     }
 
+    fn clear_session_affordances(&self, name: &str) -> Result<()> {
+        self.clear_key_tables(name)
+    }
+
     fn kill_session(&self, name: &str) -> Result<()> {
         if !self.has_session(name)? {
             return self.clear_key_tables(name);
@@ -1152,16 +1384,13 @@ impl SessionBackend for TmuxBackend {
         let target = self.session_id(name)?;
         let mut command = self.command();
         command.args(["kill-session", "-t"]).arg(target);
-        let kill_result = self.output(command);
-        let cleanup_result = self.clear_key_tables(name);
-        match (kill_result, cleanup_result) {
-            (Ok(_), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(kill_error), Err(cleanup_error)) => Err(ToolError::Message(format!(
-                "{kill_error}; failed to clean up session key tables: {cleanup_error}"
-            ))),
+        self.output(command)?;
+        if self.has_session(name)? {
+            return Err(ToolError::Message(format!(
+                "tmux session {name} is still running after termination"
+            )));
         }
+        self.clear_key_tables(name)
     }
 }
 
@@ -1189,6 +1418,10 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
     }
 
     pub fn run(&self, cwd: &Path, name: &str) -> Result<()> {
+        self.run_with_options(cwd, name, RunOptions::default())
+    }
+
+    pub fn run_with_options(&self, cwd: &Path, name: &str, options: RunOptions) -> Result<()> {
         self.sessions.ensure_available()?;
         validate_worktree_name(name)?;
 
@@ -1197,6 +1430,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         let project_name = self.git.repository_name(&root)?;
         let target = self.paths.worktree_path(&repo_id, name);
         self.paths.validate_worktree_path(&repo_id, name)?;
+        let _lock = self.paths.lock_worktree(&repo_id, name)?;
         let existing = self.find_worktree(&root, &target)?;
 
         if target.exists() && existing.is_none() {
@@ -1205,16 +1439,15 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 target.display()
             )));
         }
-        let creating = existing.is_none();
-        if let Some(worktree) = existing.as_ref()
-            && worktree.branch.as_deref() != Some(name)
-        {
+        if existing.is_some() && !target.is_dir() {
             return Err(ToolError::Message(format!(
-                "managed worktree {name} is not attached to its expected branch"
+                "managed worktree checkout is missing: {}",
+                target.display()
             )));
         }
-        if creating {
-            self.git.current_head(&root)?;
+        let creating = existing.is_none();
+        let source_head = if creating {
+            let head = self.git.current_head(&root)?;
             if self.git.source_is_dirty(&root)? {
                 return Err(ToolError::Message(
                     "source repository has uncommitted changes; commit or stash them first"
@@ -1222,11 +1455,34 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 ));
             }
             self.git.validate_branch(&root, name)?;
-        }
+            Some(head)
+        } else {
+            None
+        };
 
         let session = session_name(&repo_id, name);
         let state_path = self.paths.session_state_path(&repo_id, name);
         let live = self.sessions.has_session(&session)?;
+        if live && existing.is_none() {
+            return Err(ToolError::Message(format!(
+                "managed worktree does not exist: {name}"
+            )));
+        }
+        if let Some(worktree) = existing.as_ref() {
+            match worktree.branch.as_deref() {
+                Some(branch) if branch != name => {
+                    return Err(ToolError::Message(format!(
+                        "managed worktree {name} is not attached to its expected branch"
+                    )));
+                }
+                None if !live || !self.git.rebase_matches_branch(&target, name)? => {
+                    return Err(ToolError::Message(format!(
+                        "managed worktree {name} is not attached to its expected branch"
+                    )));
+                }
+                _ => {}
+            }
+        }
         if live {
             let state = if state_path.is_file() {
                 read_session_state(&state_path)?
@@ -1243,10 +1499,25 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             let metadata = SessionMetadata {
                 project_name: project_name.clone(),
                 worktree_name: name.to_owned(),
-                agent_name: state.agent,
+                agent_name: state.agent.clone(),
             };
-            self.sessions.configure_session(&session, &metadata)?;
-            return self.sessions.attach(&session);
+            self.sessions
+                .validate_session_metadata(&session, &metadata)?;
+            self.live_agent_pane(&session, &state)?;
+            self.revalidate_live_session(
+                &root,
+                &target,
+                name,
+                &session,
+                &state_path,
+                &project_name,
+            )?;
+            return if options.attach && options.interactive {
+                drop(_lock);
+                self.sessions.attach(&session)
+            } else {
+                Ok(())
+            };
         }
         if state_path.exists() {
             let state = read_session_state(&state_path)?;
@@ -1259,7 +1530,15 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
 
         let config = Config::load(self.paths.config_path())?;
-        let (agent_name, agent) = self.picker.pick(&config)?;
+        let environment_agent = env::var("DAVID_AGENT").ok();
+        let (agent_name, mut agent) = resolve_agent(
+            &config,
+            options.agent.as_deref(),
+            environment_agent.as_deref(),
+            options.interactive,
+            &self.picker,
+        )?;
+        agent.args.extend(options.agent_args);
         if !command_available(&agent.command) {
             return Err(ToolError::Message(format!(
                 "configured agent command is not available: {}",
@@ -1268,11 +1547,48 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
 
         if creating {
+            let expected_head = source_head
+                .as_deref()
+                .expect("creating captures source HEAD");
+            if self.git.current_head(&root)? != expected_head {
+                return Err(ToolError::Message(
+                    "source repository HEAD changed while selecting an agent".to_owned(),
+                ));
+            }
+            if self.git.source_is_dirty(&root)? {
+                return Err(ToolError::Message(
+                    "source repository has uncommitted changes; commit or stash them first"
+                        .to_owned(),
+                ));
+            }
             self.paths.prepare()?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            self.git.add_worktree(&root, name, &target)?;
+            self.git.add_worktree(&root, name, &target, expected_head)?;
+        }
+
+        self.paths.validate_worktree_path(&repo_id, name)?;
+        if !target.is_dir() {
+            return Err(ToolError::Message(format!(
+                "managed worktree checkout is missing: {}",
+                target.display()
+            )));
+        }
+        let worktree = self.find_worktree(&root, &target)?.ok_or_else(|| {
+            ToolError::Message(format!("managed worktree does not exist: {name}"))
+        })?;
+        if worktree.branch.as_deref() != Some(name) {
+            return Err(ToolError::Message(format!(
+                "managed worktree {name} is not attached to its expected branch"
+            )));
+        }
+        if let Some(expected_head) = source_head.as_deref()
+            && worktree.head != expected_head
+        {
+            return Err(ToolError::Message(format!(
+                "managed worktree {name} was not created from the observed source HEAD"
+            )));
         }
 
         self.paths.prepare()?;
@@ -1297,83 +1613,145 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         {
             Ok(pane) => pane,
             Err(error) => {
-                self.cleanup_failed_session(&state_path, &session);
-                return Err(error);
+                return Err(self.cleanup_error_without_session(error, &state_path, &session));
             }
         };
 
         let live = match self.sessions.has_session(&session) {
             Ok(live) => live,
             Err(error) => {
-                self.cleanup_failed_session(&state_path, &session);
-                return Err(error);
+                return Err(self.cleanup_error(error, &state_path, &session));
             }
         };
         if !live {
-            let _ = fs::remove_file(&state_path);
-            return Err(ToolError::Message(format!(
+            let error = ToolError::Message(format!(
                 "agent session {session} exited before it could be attached"
-            )));
+            ));
+            return Err(self.cleanup_error(error, &state_path, &session));
         }
         if let Some(pane) = pane.as_deref() {
             let alive = match self.sessions.pane_is_alive(&session, pane) {
                 Ok(alive) => alive,
                 Err(error) => {
-                    self.cleanup_failed_session(&state_path, &session);
-                    return Err(error);
+                    return Err(self.cleanup_error(error, &state_path, &session));
                 }
             };
             if !alive {
-                self.cleanup_failed_session(&state_path, &session);
-                return Err(ToolError::Message(format!(
-                    "agent pane {pane} in session {session} is dead"
-                )));
+                let error =
+                    ToolError::Message(format!("agent pane {pane} in session {session} is dead"));
+                return Err(self.cleanup_error(error, &state_path, &session));
             }
         }
         state.pane = pane;
         if let Err(error) = write_session_state(&state_path, &state) {
-            self.cleanup_failed_session(&state_path, &session);
-            return Err(error);
+            return Err(self.cleanup_error(error, &state_path, &session));
         }
-        if !self.sessions.has_session(&session)? {
-            fs::remove_file(&state_path)?;
-            return Err(ToolError::Message(format!(
+        let live = match self.sessions.has_session(&session) {
+            Ok(live) => live,
+            Err(error) => {
+                return Err(self.cleanup_error(error, &state_path, &session));
+            }
+        };
+        if !live {
+            let error = ToolError::Message(format!(
                 "agent session {session} exited before it could be attached"
-            )));
+            ));
+            return Err(self.cleanup_error(error, &state_path, &session));
         }
         if let Err(error) = self.sessions.configure_session(&session, &metadata) {
-            let alive = match self.sessions.has_session(&session) {
-                Ok(alive) => alive,
-                Err(check_error) => {
-                    return Err(ToolError::Message(format!(
-                        "{error}; could not verify agent session cleanup: {check_error}"
-                    )));
-                }
-            };
-            if alive && let Err(cleanup_error) = self.sessions.kill_session(&session) {
-                return Err(ToolError::Message(format!(
-                    "{error}; failed to clean up agent session: {cleanup_error}"
-                )));
-            }
-            if let Err(state_error) = fs::remove_file(&state_path) {
-                return Err(ToolError::Message(format!(
-                    "{error}; failed to remove session metadata: {state_error}"
-                )));
-            }
-            if !alive {
-                return Err(ToolError::Message(format!(
-                    "agent session {session} exited before it could be attached"
-                )));
-            }
-            return Err(error);
+            return Err(self.cleanup_error(error, &state_path, &session));
         }
-        if !self.sessions.has_session(&session)? {
-            fs::remove_file(&state_path)?;
-
-            return Err(ToolError::Message(format!(
+        let live = match self.sessions.has_session(&session) {
+            Ok(live) => live,
+            Err(error) => {
+                return Err(self.cleanup_error(error, &state_path, &session));
+            }
+        };
+        if !live {
+            let error = ToolError::Message(format!(
                 "agent session {session} exited before it could be attached"
+            ));
+            return Err(self.cleanup_error(error, &state_path, &session));
+        }
+        if let Err(error) = self.revalidate_live_session(
+            &root,
+            &target,
+            name,
+            &session,
+            &state_path,
+            &metadata.project_name,
+        ) {
+            return Err(self.cleanup_error(error, &state_path, &session));
+        }
+        if options.attach && options.interactive {
+            drop(_lock);
+            self.sessions.attach(&session)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn attach(&self, cwd: &Path, name: &str) -> Result<()> {
+        self.sessions.ensure_available()?;
+        validate_worktree_name(name)?;
+
+        let root = self.git.repository_root(cwd)?;
+        let repo_id = self.git.repository_id(&root)?;
+        let project_name = self.git.repository_name(&root)?;
+        let target = self.paths.worktree_path(&repo_id, name);
+        self.paths.validate_worktree_path(&repo_id, name)?;
+        let _lock = self.paths.lock_worktree(&repo_id, name)?;
+        if !target.is_dir() {
+            return Err(ToolError::Message(format!(
+                "managed worktree does not exist: {name}"
             )));
         }
+        let worktree = self.find_worktree(&root, &target)?.ok_or_else(|| {
+            ToolError::Message(format!("managed worktree does not exist: {name}"))
+        })?;
+        let session = session_name(&repo_id, name);
+        let live = self.sessions.has_session(&session)?;
+        match worktree.branch.as_deref() {
+            Some(branch) if branch != name => {
+                return Err(ToolError::Message(format!(
+                    "managed worktree {name} is not attached to its expected branch"
+                )));
+            }
+            None if !live || !self.git.rebase_matches_branch(&target, name)? => {
+                return Err(ToolError::Message(format!(
+                    "managed worktree {name} is not attached to its expected branch"
+                )));
+            }
+            _ => {}
+        }
+        if !live {
+            return Err(ToolError::Message(format!(
+                "managed agent session {session} is missing or not running"
+            )));
+        }
+
+        let state_path = self.paths.session_state_path(&repo_id, name);
+        if !state_path.is_file() {
+            return Err(ToolError::Message(format!(
+                "tmux session {session} exists but is not managed by david"
+            )));
+        }
+        let state = read_session_state(&state_path)?;
+        if !state.matches(&repo_id, name, &target, &session) {
+            return Err(ToolError::Message(format!(
+                "tmux session {session} metadata does not match the requested worktree"
+            )));
+        }
+        let metadata = SessionMetadata {
+            project_name: project_name.clone(),
+            worktree_name: name.to_owned(),
+            agent_name: state.agent.clone(),
+        };
+        self.sessions
+            .validate_session_metadata(&session, &metadata)?;
+        self.live_agent_pane(&session, &state)?;
+        self.revalidate_live_session(&root, &target, name, &session, &state_path, &project_name)?;
+        drop(_lock);
         self.sessions.attach(&session)
     }
 
@@ -1383,8 +1761,10 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
 
         let root = self.git.repository_root(cwd)?;
         let repo_id = self.git.repository_id(&root)?;
+        let project_name = self.git.repository_name(&root)?;
         let target = self.paths.worktree_path(&repo_id, name);
         self.paths.validate_worktree_path(&repo_id, name)?;
+        let _lock = self.paths.lock_worktree(&repo_id, name)?;
         if !target.is_dir() {
             return Err(ToolError::Message(format!(
                 "managed worktree does not exist: {name}"
@@ -1426,19 +1806,32 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             )));
         }
 
-        let pane = match state.pane {
-            Some(pane) => Some(pane),
-            None => self.sessions.agent_pane(&session)?,
+        let metadata = SessionMetadata {
+            project_name,
+            worktree_name: name.to_owned(),
+            agent_name: state.agent.clone(),
         };
-        if let Some(pane) = pane.as_deref()
-            && !self.sessions.pane_is_alive(&session, pane)?
-        {
+        self.sessions
+            .validate_session_metadata(&session, &metadata)?;
+        let pane = self.live_agent_pane(&session, &state)?;
+        self.revalidate_live_session(
+            &root,
+            &target,
+            name,
+            &session,
+            &state_path,
+            &metadata.project_name,
+        )?;
+        let final_worktree = self.find_worktree(&root, &target)?.ok_or_else(|| {
+            ToolError::Message(format!("managed worktree does not exist: {name}"))
+        })?;
+        if final_worktree.branch.as_deref() != Some(name) {
             return Err(ToolError::Message(format!(
-                "agent pane {pane} in session {session} is dead"
+                "managed worktree {name} is not attached to its expected branch"
             )));
         }
         self.sessions
-            .deliver_prompt_to(&session, message, pane.as_deref())
+            .deliver_prompt_to(&session, message, Some(&pane))
             .map_err(|error| {
                 ToolError::Message(format!(
                     "failed to deliver prompt to agent session {session}: {error}"
@@ -1450,14 +1843,15 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         self.sessions.ensure_available()?;
         let root = self.git.repository_root(cwd)?;
         let repo_id = self.git.repository_id(&root)?;
+        let project_name = self.git.repository_name(&root)?;
         let base = self.paths.repository_worktrees(&repo_id);
         let base = fs::canonicalize(&base).unwrap_or(base);
         let worktrees = self.git.worktrees(&root)?;
 
         writeln!(output, "NAME\tBRANCH\tAGENT\tPATH")?;
         let mut count = 0;
-        for worktree in worktrees {
-            let Some(relative) = worktree.path.strip_prefix(&base).ok() else {
+        for listed_worktree in worktrees {
+            let Some(relative) = listed_worktree.path.strip_prefix(&base).ok() else {
                 continue;
             };
             if relative.as_os_str().is_empty() {
@@ -1467,6 +1861,15 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             if self.paths.validate_worktree_path(&repo_id, &name).is_err() {
                 continue;
             }
+            let _lock = self.paths.lock_worktree(&repo_id, &name)?;
+            let Some(worktree) = self
+                .git
+                .worktrees(&root)?
+                .into_iter()
+                .find(|current| current.path == listed_worktree.path)
+            else {
+                continue;
+            };
             let session = session_name(&repo_id, &name);
             let state_path = self.paths.session_state_path(&repo_id, &name);
             let agent = if state_path.is_file() {
@@ -1477,20 +1880,26 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                             "session metadata does not match managed worktree {name}"
                         )));
                     }
-                    let pane_alive = if let Some(pane) = state.pane.as_deref() {
-                        self.sessions
-                            .pane_is_alive(&session, pane)
-                            .unwrap_or_default()
-                    } else {
-                        match self.sessions.agent_pane(&session) {
-                            Ok(Some(pane)) => self
-                                .sessions
-                                .pane_is_alive(&session, &pane)
-                                .unwrap_or_default(),
-                            Ok(None) | Err(_) => false,
-                        }
+                    let metadata = SessionMetadata {
+                        project_name: project_name.clone(),
+                        worktree_name: name.clone(),
+                        agent_name: state.agent.clone(),
                     };
-                    if pane_alive {
+                    self.sessions
+                        .validate_session_metadata(&session, &metadata)?;
+                    let checkout_exists = worktree.path.is_dir();
+                    let branch_matches = checkout_exists
+                        && match worktree.branch.as_deref() {
+                            Some(branch) => branch == name,
+                            None => self.git.rebase_matches_branch(&worktree.path, &name)?,
+                        };
+                    let pane_alive = state
+                        .pane
+                        .as_deref()
+                        .map(|pane| self.sessions.pane_is_alive(&session, pane))
+                        .transpose()?
+                        .unwrap_or(false);
+                    if checkout_exists && branch_matches && pane_alive {
                         state.agent
                     } else {
                         "-".to_owned()
@@ -1521,18 +1930,23 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
 
         let root = self.git.repository_root(cwd)?;
         let repo_id = self.git.repository_id(&root)?;
+        let project_name = self.git.repository_name(&root)?;
         let target = self.paths.worktree_path(&repo_id, name);
         self.paths.validate_worktree_path(&repo_id, name)?;
-        let worktree = self.find_worktree(&root, &target)?.ok_or_else(|| {
-            ToolError::Message(format!("managed worktree does not exist: {name}"))
-        })?;
+        let _lock = self.paths.lock_worktree(&repo_id, name)?;
+        let worktree = self
+            .find_worktree_for_removal(&root, &target)?
+            .ok_or_else(|| {
+                ToolError::Message(format!("managed worktree does not exist: {name}"))
+            })?;
         if worktree.branch.as_deref() != Some(name) {
             return Err(ToolError::Message(format!(
                 "managed worktree {name} is not attached to its expected branch"
             )));
         }
+        let expected_branch_head = self.git.branch_head(&root, name)?;
 
-        if !force && self.git.worktree_is_dirty(&target)? {
+        if !force && target.is_dir() && self.git.worktree_is_dirty(&target)? {
             return Err(ToolError::Message(format!(
                 "worktree {name} has uncommitted changes; use --force to remove it"
             )));
@@ -1548,6 +1962,15 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                     "session metadata does not match managed worktree {name}"
                 )));
             }
+            if live {
+                let metadata = SessionMetadata {
+                    project_name,
+                    worktree_name: name.to_owned(),
+                    agent_name: state.agent,
+                };
+                self.sessions
+                    .validate_session_metadata(&session, &metadata)?;
+            }
         } else if live {
             return Err(ToolError::Message(format!(
                 "tmux session {session} exists but is not managed by david"
@@ -1555,35 +1978,203 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
         if live {
             self.sessions.kill_session(&session)?;
-            if !force && self.git.worktree_is_dirty(&target)? {
+            if self.sessions.has_session(&session)? {
+                return Err(ToolError::Message(format!(
+                    "agent session {session} is still running; worktree was not removed"
+                )));
+            }
+            if !force && target.is_dir() && self.git.worktree_is_dirty(&target)? {
                 return Err(ToolError::Message(format!(
                     "worktree {name} changed while its agent was stopping; the session is stopped but the worktree was not removed"
                 )));
             }
+        } else {
+            self.sessions.clear_session_affordances(&session)?;
+        }
+        self.paths.validate_worktree_path(&repo_id, name)?;
+        let checkout_exists = target.is_dir();
+        let final_worktree = self
+            .find_worktree_for_removal(&root, &target)?
+            .ok_or_else(|| {
+                ToolError::Message(format!("managed worktree does not exist: {name}"))
+            })?;
+        if final_worktree.branch.as_deref() != Some(name) {
+            return Err(ToolError::Message(format!(
+                "managed worktree {name} is not attached to its expected branch"
+            )));
+        }
+        let current_branch_head = self.git.branch_head(&root, name)?;
+        if current_branch_head != expected_branch_head {
+            return Err(ToolError::Message(format!(
+                "branch {name} changed while its worktree was being removed"
+            )));
+        }
+        let target_identity = canonicalize_with_missing(&target).ok();
+        if self.git.worktrees(&root)?.into_iter().any(|other| {
+            canonicalize_with_missing(&other.path).ok() != target_identity
+                && other.branch.as_deref() == Some(name)
+        }) {
+            return Err(ToolError::Message(format!(
+                "branch {name} is attached to another worktree"
+            )));
         }
         let branch_root = self.git.branch_command_root(&root, &target)?;
-        self.git.remove_worktree(&root, &target, force)?;
-        self.git.delete_branch(&branch_root, name)?;
+        self.git
+            .remove_worktree(&root, &target, force || !checkout_exists)?;
+        self.git
+            .delete_branch(&branch_root, name, &expected_branch_head)?;
         if state_path.exists() {
             fs::remove_file(state_path)?;
         }
         Ok(())
     }
 
-    fn cleanup_failed_session(&self, state_path: &Path, session: &str) {
-        let _ = fs::remove_file(state_path);
-        let _ = self.sessions.kill_session(session);
+    fn live_agent_pane(&self, session: &str, state: &SessionState) -> Result<String> {
+        let pane = state.pane.clone().ok_or_else(|| {
+            ToolError::Message(format!(
+                "tmux session {session} has no persisted agent pane"
+            ))
+        })?;
+        if !self.sessions.pane_is_alive(session, &pane)? {
+            return Err(ToolError::Message(format!(
+                "agent pane {pane} in session {session} is dead"
+            )));
+        }
+        Ok(pane)
+    }
+
+    fn revalidate_live_session(
+        &self,
+        root: &Path,
+        target: &Path,
+        name: &str,
+        session: &str,
+        state_path: &Path,
+        project_name: &str,
+    ) -> Result<()> {
+        if !self.sessions.has_session(session)? {
+            return Err(ToolError::Message(format!(
+                "agent session {session} exited before it could be attached"
+            )));
+        }
+        let repo_id = self.git.repository_id(root)?;
+        self.paths.validate_worktree_path(&repo_id, name)?;
+        if !target.is_dir() {
+            return Err(ToolError::Message(format!(
+                "managed worktree checkout is missing: {}",
+                target.display()
+            )));
+        }
+        let worktree = self.find_worktree(root, target)?.ok_or_else(|| {
+            ToolError::Message(format!("managed worktree does not exist: {name}"))
+        })?;
+        let state = read_session_state(state_path)?;
+        if !state.matches(&repo_id, name, target, session) {
+            return Err(ToolError::Message(format!(
+                "tmux session {session} metadata does not match the requested worktree"
+            )));
+        }
+        let metadata = SessionMetadata {
+            project_name: project_name.to_owned(),
+            worktree_name: name.to_owned(),
+            agent_name: state.agent.clone(),
+        };
+        self.sessions
+            .validate_session_metadata(session, &metadata)?;
+        self.live_agent_pane(session, &state)?;
+        match worktree.branch.as_deref() {
+            Some(branch) if branch != name => Err(ToolError::Message(format!(
+                "managed worktree {name} is not attached to its expected branch"
+            ))),
+            None if !self.git.rebase_matches_branch(target, name)? => Err(ToolError::Message(
+                format!("managed worktree {name} is not attached to its expected branch"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn cleanup_error_without_session(
+        &self,
+        error: ToolError,
+        state_path: &Path,
+        session: &str,
+    ) -> ToolError {
+        match self.sessions.has_session(session) {
+            Ok(true) => ToolError::Message(format!(
+                "{error}; failed to clean up agent session {session}; session metadata was retained"
+            )),
+            Ok(false) => match self.sessions.clear_session_affordances(session) {
+                Err(cleanup_error) => ToolError::Message(format!(
+                    "{error}; failed to clean up session affordances: {cleanup_error}"
+                )),
+                Ok(()) => match fs::remove_file(state_path) {
+                    Ok(()) => error,
+                    Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => error,
+                    Err(cleanup_error) => ToolError::Message(format!(
+                        "{error}; failed to remove session metadata: {cleanup_error}"
+                    )),
+                },
+            },
+            Err(check_error) => ToolError::Message(format!(
+                "{error}; could not verify agent session cleanup: {check_error}; session metadata was retained"
+            )),
+        }
+    }
+
+    fn cleanup_failed_session(&self, state_path: &Path, session: &str) -> Result<()> {
+        if self.sessions.has_session(session)? {
+            self.sessions.kill_session(session)?;
+            if self.sessions.has_session(session)? {
+                return Err(ToolError::Message(format!(
+                    "agent session {session} is still running after cleanup"
+                )));
+            }
+        } else {
+            self.sessions.clear_session_affordances(session)?;
+        }
+        if state_path.exists() {
+            fs::remove_file(state_path)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_error(&self, error: ToolError, state_path: &Path, session: &str) -> ToolError {
+        match self.cleanup_failed_session(state_path, session) {
+            Ok(()) => error,
+            Err(cleanup_error) => ToolError::Message(format!(
+                "{error}; failed to clean up agent session: {cleanup_error}"
+            )),
+        }
     }
 
     fn find_worktree(&self, root: &Path, target: &Path) -> Result<Option<Worktree>> {
-        let expected = fs::canonicalize(target).ok();
+        let Ok(expected) = fs::canonicalize(target) else {
+            return Ok(None);
+        };
         for worktree in self.git.worktrees(root)? {
-            let actual = fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
-            if expected.as_ref() == Some(&actual) || worktree.path == target {
+            let Ok(actual) = fs::canonicalize(&worktree.path) else {
+                continue;
+            };
+            if expected == actual {
                 return Ok(Some(worktree));
             }
         }
         Ok(None)
+    }
+
+    fn find_worktree_for_removal(&self, root: &Path, target: &Path) -> Result<Option<Worktree>> {
+        if let Some(worktree) = self.find_worktree(root, target)? {
+            return Ok(Some(worktree));
+        }
+        if target.exists() {
+            return Ok(None);
+        }
+        let expected = canonicalize_with_missing(target).ok();
+        Ok(self
+            .git
+            .worktrees(root)?
+            .into_iter()
+            .find(|worktree| canonicalize_with_missing(&worktree.path).ok() == expected))
     }
 }
 
@@ -1792,8 +2383,8 @@ fn canonicalize_with_missing(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn same_path(first: &Path, second: &Path) -> bool {
-    let first = fs::canonicalize(first).unwrap_or_else(|_| first.to_path_buf());
-    let second = fs::canonicalize(second).unwrap_or_else(|_| second.to_path_buf());
+    let first = canonicalize_with_missing(first).unwrap_or_else(|_| first.to_path_buf());
+    let second = canonicalize_with_missing(second).unwrap_or_else(|_| second.to_path_buf());
     first == second
 }
 
@@ -1864,7 +2455,9 @@ mod tests {
     struct FakeSessionState {
         live: BTreeSet<String>,
         created: Vec<String>,
+        created_agents: Vec<Agent>,
         configured: Vec<(String, SessionMetadata)>,
+        metadata: BTreeMap<String, SessionMetadata>,
         attached: Vec<String>,
         killed: Vec<String>,
         configure_error: Option<String>,
@@ -1882,10 +2475,11 @@ mod tests {
             Ok(self.state.borrow().live.contains(name))
         }
 
-        fn create_session(&self, name: &str, _cwd: &Path, _agent: &Agent) -> Result<()> {
+        fn create_session(&self, name: &str, _cwd: &Path, agent: &Agent) -> Result<()> {
             let mut state = self.state.borrow_mut();
             state.live.insert(name.to_owned());
             state.created.push(name.to_owned());
+            state.created_agents.push(agent.clone());
             Ok(())
         }
 
@@ -1895,7 +2489,18 @@ mod tests {
                 return Err(ToolError::Message(message.clone()));
             }
             state.configured.push((name.to_owned(), metadata.clone()));
+            state.metadata.insert(name.to_owned(), metadata.clone());
             Ok(())
+        }
+
+        fn validate_session_metadata(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+            if self.state.borrow().metadata.get(name) == Some(metadata) {
+                Ok(())
+            } else {
+                Err(ToolError::Message(format!(
+                    "tmux session {name} metadata does not match"
+                )))
+            }
         }
 
         fn agent_pane(&self, _name: &str) -> Result<Option<String>> {
@@ -2054,6 +2659,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingPicker {
+        calls: Rc<RefCell<usize>>,
+    }
+
+    impl AgentPicker for RecordingPicker {
+        fn pick(&self, config: &Config) -> Result<(String, Agent)> {
+            *self.calls.borrow_mut() += 1;
+            FirstAgentPicker.pick(config)
+        }
+    }
+
     fn test_app(paths: DavidPaths, sessions: FakeSessions) -> App<FakeSessions, FirstAgentPicker> {
         App::with_picker(paths, sessions, FirstAgentPicker)
     }
@@ -2102,6 +2719,16 @@ mod tests {
         assert!(status.success(), "git command failed: {args:?}");
     }
 
+    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(output.status.success(), "git command failed: {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
     fn configured_paths(home: &Path) -> DavidPaths {
         let paths = DavidPaths::from_home(home);
         fs::create_dir_all(paths.config_path().parent().unwrap()).unwrap();
@@ -2111,6 +2738,139 @@ mod tests {
         )
         .unwrap();
         paths
+    }
+
+    fn multi_agent_configured_paths(home: &Path) -> DavidPaths {
+        let paths = DavidPaths::from_home(home);
+        fs::create_dir_all(paths.config_path().parent().unwrap()).unwrap();
+        fs::write(
+            paths.config_path(),
+            "default_agent = \"claude\"\n\n[agents.claude]\ncommand = \"echo\"\nargs = [\"claude-default\"]\n\n[agents.codex]\ncommand = \"printf\"\nargs = [\"codex-default\"]\n",
+        )
+        .unwrap();
+        paths
+    }
+
+    #[test]
+    fn agent_resolution_uses_precedence_and_never_picks_for_an_unknown_name() {
+        let config = Config {
+            default_agent: Some("default".to_owned()),
+            agents: [
+                (
+                    "default".to_owned(),
+                    Agent {
+                        command: "default-command".to_owned(),
+                        args: vec![],
+                    },
+                ),
+                (
+                    "environment".to_owned(),
+                    Agent {
+                        command: "environment-command".to_owned(),
+                        args: vec![],
+                    },
+                ),
+                (
+                    "explicit".to_owned(),
+                    Agent {
+                        command: "explicit-command".to_owned(),
+                        args: vec![],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let picker = RecordingPicker::default();
+
+        let (name, _) = resolve_agent(
+            &config,
+            Some("explicit"),
+            Some("environment"),
+            false,
+            &picker,
+        )
+        .unwrap();
+        assert_eq!(name, "explicit");
+        let (name, _) = resolve_agent(&config, None, Some("environment"), false, &picker).unwrap();
+        assert_eq!(name, "environment");
+        let (name, _) = resolve_agent(&config, None, None, false, &picker).unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(*picker.calls.borrow(), 0);
+
+        let error = resolve_agent(&config, Some("missing"), None, true, &picker).unwrap_err();
+        assert!(matches!(error, ToolError::UnknownAgent { name } if name == "missing"));
+        assert_eq!(*picker.calls.borrow(), 0);
+    }
+
+    #[test]
+    fn agent_resolution_uses_the_sole_agent_or_picker_and_rejects_noninteractive_selection() {
+        let sole = Config {
+            default_agent: None,
+            agents: [(
+                "sole".to_owned(),
+                Agent {
+                    command: "sole-command".to_owned(),
+                    args: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let picker = RecordingPicker::default();
+        assert_eq!(
+            resolve_agent(&sole, None, None, false, &picker).unwrap().0,
+            "sole"
+        );
+        assert_eq!(*picker.calls.borrow(), 0);
+
+        let multiple = Config {
+            default_agent: None,
+            agents: [
+                (
+                    "first".to_owned(),
+                    Agent {
+                        command: "first-command".to_owned(),
+                        args: vec![],
+                    },
+                ),
+                (
+                    "second".to_owned(),
+                    Agent {
+                        command: "second-command".to_owned(),
+                        args: vec![],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let error = resolve_agent(&multiple, None, None, false, &picker).unwrap_err();
+        assert!(matches!(error, ToolError::AgentSelectionUnavailable));
+        assert_eq!(*picker.calls.borrow(), 0);
+        assert_eq!(
+            resolve_agent(&multiple, None, None, true, &picker)
+                .unwrap()
+                .0,
+            "first"
+        );
+        assert_eq!(*picker.calls.borrow(), 1);
+    }
+
+    #[test]
+    fn config_rejects_an_unknown_default_agent_at_load_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "default_agent = \"missing\"\n\n[agents.codex]\ncommand = \"codex\"\n",
+        )
+        .unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+
+        assert!(error.to_string().contains("default_agent"));
+        assert!(error.to_string().contains("missing"));
     }
 
     #[test]
@@ -2282,9 +3042,284 @@ mod tests {
 
         app.run(repo.path(), "feature").unwrap();
         assert_eq!(sessions.state.borrow().created.len(), 1);
-        assert_eq!(sessions.state.borrow().configured.len(), 2);
-        assert_eq!(sessions.state.borrow().configured[1].1, expected);
+        assert_eq!(sessions.state.borrow().configured.len(), 1);
+        assert_eq!(sessions.state.borrow().configured[0].1, expected);
         assert_eq!(sessions.state.borrow().attached.len(), 2);
+    }
+
+    #[test]
+    fn run_reuses_a_matching_session_without_reconfiguring_it() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths, sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        sessions.state.borrow_mut().configure_error = Some("must not configure".to_owned());
+
+        app.run(repo.path(), "feature").unwrap();
+
+        assert_eq!(sessions.state.borrow().configured.len(), 1);
+        assert_eq!(sessions.state.borrow().attached.len(), 2);
+    }
+
+    #[test]
+    fn run_options_append_literal_runtime_args_and_detach_without_attaching() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = multi_agent_configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = App::with_picker(paths.clone(), sessions.clone(), FirstAgentPicker);
+
+        app.run_with_options(
+            repo.path(),
+            "feature",
+            RunOptions {
+                agent: Some("codex".to_owned()),
+                agent_args: vec!["--model".to_owned(), "gpt 5.6".to_owned(), "$()".to_owned()],
+                interactive: false,
+                attach: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            sessions.state.borrow().created_agents,
+            vec![Agent {
+                command: "printf".to_owned(),
+                args: vec![
+                    "codex-default".to_owned(),
+                    "--model".to_owned(),
+                    "gpt 5.6".to_owned(),
+                    "$()".to_owned(),
+                ],
+            }]
+        );
+        assert!(sessions.state.borrow().attached.is_empty());
+        assert_eq!(sessions.state.borrow().created.len(), 1);
+
+        fs::remove_file(paths.config_path()).unwrap();
+        app.attach(repo.path(), "feature").unwrap();
+        assert_eq!(sessions.state.borrow().created.len(), 1);
+        assert_eq!(sessions.state.borrow().attached.len(), 1);
+    }
+
+    #[test]
+    fn managed_operations_reject_mismatched_tmux_ownership_metadata() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let session = session_name(&repo_id, "feature");
+        sessions
+            .state
+            .borrow_mut()
+            .metadata
+            .get_mut(&session)
+            .unwrap()
+            .worktree_name = "other".to_owned();
+
+        assert!(app.attach(repo.path(), "feature").is_err());
+        assert!(app.prompt(repo.path(), "feature", "message").is_err());
+        assert!(app.list(repo.path(), &mut Vec::new()).is_err());
+        assert!(app.remove(repo.path(), "feature", true).is_err());
+        assert!(sessions.state.borrow().live.contains(&session));
+    }
+
+    #[test]
+    fn run_and_attach_reject_a_live_session_with_a_dead_agent_pane() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = PaneSessions::default();
+        sessions.state.borrow_mut().pane = Some("%42".to_owned());
+        let app = App::with_picker(paths, sessions.clone(), FirstAgentPicker);
+
+        app.run(repo.path(), "feature").unwrap();
+        sessions.state.borrow_mut().pane_dead = true;
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("dead"));
+        let error = app.attach(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("dead"));
+    }
+
+    #[test]
+    fn run_rejects_a_live_session_when_the_managed_checkout_is_missing() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let target = paths.worktree_path(
+            &Git::default().repository_id(repo.path()).unwrap(),
+            "feature",
+        );
+        fs::remove_dir_all(&target).unwrap();
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+
+        assert!(
+            error.to_string().contains("checkout is missing")
+                || error
+                    .to_string()
+                    .contains("managed worktree does not exist")
+        );
+        assert_eq!(sessions.state.borrow().configured.len(), 1);
+        assert_eq!(sessions.state.borrow().live.len(), 1);
+
+        app.remove(repo.path(), "feature", true).unwrap();
+        assert!(sessions.state.borrow().live.is_empty());
+        assert!(
+            !paths
+                .session_state_path(
+                    &Git::default().repository_id(repo.path()).unwrap(),
+                    "feature"
+                )
+                .exists()
+        );
+        assert!(
+            !Command::new("git")
+                .current_dir(repo.path())
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/feature"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn explicit_attach_rejects_a_missing_session_without_side_effects() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths, sessions.clone());
+
+        app.run_with_options(
+            repo.path(),
+            "feature",
+            RunOptions {
+                attach: false,
+                ..RunOptions::default()
+            },
+        )
+        .unwrap();
+        sessions.state.borrow_mut().live.clear();
+
+        let error = app.attach(repo.path(), "feature").unwrap_err();
+
+        assert!(error.to_string().contains("missing or not running"));
+        assert!(sessions.state.borrow().attached.is_empty());
+        assert_eq!(sessions.state.borrow().created.len(), 1);
+    }
+
+    #[test]
+    fn run_and_attach_allow_only_a_matching_live_session_during_rebase() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_branch = git_stdout(repo.path(), &["branch", "--show-current"]);
+        fs::write(repo.path().join("README.md"), "source change\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-qm", "source change"]);
+
+        let id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&id, "feature");
+        fs::write(target.join("README.md"), "feature change\n").unwrap();
+        run_git(&target, &["add", "README.md"]);
+        run_git(&target, &["commit", "-qm", "feature change"]);
+        let status = Command::new("git")
+            .current_dir(&target)
+            .args(["rebase", &repo_branch])
+            .status()
+            .unwrap();
+        assert!(!status.success());
+
+        app.run(repo.path(), "feature").unwrap();
+        app.attach(repo.path(), "feature").unwrap();
+
+        assert_eq!(sessions.state.borrow().created.len(), 1);
+        assert_eq!(sessions.state.borrow().attached.len(), 3);
+        let _ = Command::new("git")
+            .current_dir(&target)
+            .args(["rebase", "--abort"])
+            .status();
+    }
+
+    #[test]
+    fn run_and_attach_reject_arbitrary_detached_and_wrong_branches() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&id, "feature");
+        run_git(&target, &["checkout", "--detach", "HEAD"]);
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("expected branch"));
+        let error = app.attach(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("expected branch"));
+        assert_eq!(sessions.state.borrow().attached.len(), 1);
+
+        run_git(&target, &["switch", "-c", "other"]);
+        let error = app.run(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("expected branch"));
+        let error = app.attach(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("expected branch"));
+        assert_eq!(sessions.state.borrow().attached.len(), 1);
+    }
+
+    #[test]
+    fn rebase_detached_worktree_without_a_live_session_is_rejected() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_branch = git_stdout(repo.path(), &["branch", "--show-current"]);
+        let id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&id, "feature");
+        fs::write(repo.path().join("README.md"), "source change\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-qm", "source change"]);
+        fs::write(target.join("README.md"), "feature change\n").unwrap();
+        run_git(&target, &["add", "README.md"]);
+        run_git(&target, &["commit", "-qm", "feature change"]);
+        let status = Command::new("git")
+            .current_dir(&target)
+            .args(["rebase", &repo_branch])
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        sessions.state.borrow_mut().live.clear();
+
+        let error = app.run(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("expected branch"));
+        let error = app.attach(repo.path(), "feature").unwrap_err();
+        assert!(error.to_string().contains("expected branch"));
+        assert_eq!(sessions.state.borrow().created.len(), 1);
+        let _ = Command::new("git")
+            .current_dir(&target)
+            .args(["rebase", "--abort"])
+            .status();
     }
 
     #[test]
@@ -2612,25 +3647,6 @@ mod tests {
     }
 
     #[test]
-    fn existing_session_configuration_failure_keeps_agent_alive() {
-        let repo = init_repo();
-        let home = tempfile::tempdir().unwrap();
-        let paths = configured_paths(home.path());
-        let sessions = FakeSessions::default();
-        let app = test_app(paths, sessions.clone());
-
-        app.run(repo.path(), "feature").unwrap();
-        sessions.state.borrow_mut().configure_error = Some("configuration failed".to_owned());
-
-        let error = app.run(repo.path(), "feature").unwrap_err();
-
-        assert_eq!(error.to_string(), "configuration failed");
-        assert_eq!(sessions.state.borrow().killed.len(), 0);
-        assert_eq!(sessions.state.borrow().attached.len(), 1);
-        assert_eq!(sessions.state.borrow().live.len(), 1);
-    }
-
-    #[test]
     fn new_session_configuration_failure_keeps_state_when_cleanup_fails() {
         let repo = init_repo();
         let home = tempfile::tempdir().unwrap();
@@ -2678,7 +3694,11 @@ mod tests {
             return;
         }
 
-        let session = format!("david-test-{}-{}", std::process::id(), stable_hash("tmux"));
+        let session = format!(
+            "david-test-{}-{}",
+            std::process::id(),
+            stable_hash("tmux-affordances")
+        );
         let directory = tempfile::tempdir().unwrap();
         let backend = TmuxBackend::default();
         let agent = Agent {
@@ -2696,6 +3716,32 @@ mod tests {
             .unwrap();
         backend.configure_session(&session, &metadata).unwrap();
         assert!(backend.has_session(&session).unwrap());
+        backend
+            .validate_session_metadata(&session, &metadata)
+            .unwrap();
+        let mismatch = SessionMetadata {
+            agent_name: "other".to_owned(),
+            ..metadata.clone()
+        };
+        assert!(
+            backend
+                .validate_session_metadata(&session, &mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("metadata does not match")
+        );
+        let spaced_metadata = SessionMetadata {
+            project_name: " project ".to_owned(),
+            worktree_name: " feature ".to_owned(),
+            agent_name: " agent ".to_owned(),
+        };
+        backend
+            .configure_session(&session, &spaced_metadata)
+            .unwrap();
+        backend
+            .validate_session_metadata(&session, &spaced_metadata)
+            .unwrap();
+        backend.configure_session(&session, &metadata).unwrap();
 
         let show_option = |option: &str| {
             let mut command = backend.command();
@@ -2791,7 +3837,47 @@ mod tests {
     }
 
     #[test]
-    fn list_preserves_active_status_for_a_live_legacy_session() {
+    fn list_reports_detached_or_wrong_branch_sessions_as_inactive() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        run_git(&target, &["checkout", "--detach", "HEAD"]);
+
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("feature\t(detached)\t-\t")
+        );
+
+        run_git(&target, &["switch", "-c", "other"]);
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("feature\tother\t-\t")
+        );
+
+        fs::remove_dir_all(&target).unwrap();
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("feature\tother\t-\t")
+        );
+    }
+
+    #[test]
+    fn list_reports_a_legacy_pane_less_session_as_inactive() {
         let repo = init_repo();
         let home = tempfile::tempdir().unwrap();
         let paths = configured_paths(home.path());
@@ -2816,7 +3902,7 @@ mod tests {
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("feature\tfeature\ttest\t")
+                .contains("feature\tfeature\t-\t")
         );
     }
 
@@ -3221,14 +4307,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tmux_agent_pane_rejects_a_dead_pane() {
+    fn tmux_agent_pane_reports_a_dead_pane_for_separate_liveness_check() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("fake-tmux");
         fs::write(
             &program,
-            "#!/bin/sh\nprintf '%s\\n' '%42|david-managed|1'\n",
+            "#!/bin/sh\ncase \" $* \" in\n  *display-message*) printf '%s\\n' 'david-managed|1' ;;\n  *) printf '%s\\n' '%42|david-managed|1' ;;\nesac\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&program).unwrap().permissions();
@@ -3236,9 +4322,11 @@ mod tests {
         fs::set_permissions(&program, permissions).unwrap();
 
         let backend = TmuxBackend::new(program.as_os_str().to_owned());
-        let error = backend.agent_pane("david-managed").unwrap_err();
-
-        assert!(error.to_string().contains("dead"));
+        assert_eq!(
+            backend.agent_pane("david-managed").unwrap().as_deref(),
+            Some("%42")
+        );
+        assert!(!backend.pane_is_alive("david-managed", "%42").unwrap());
     }
 
     #[cfg(unix)]
@@ -3372,7 +4460,11 @@ mod tests {
             return;
         }
 
-        let session = format!("david-test-{}-{}", std::process::id(), stable_hash("tmux"));
+        let session = format!(
+            "david-test-{}-{}",
+            std::process::id(),
+            stable_hash("tmux-lifecycle")
+        );
         let directory = tempfile::tempdir().unwrap();
         let backend = TmuxBackend::default();
         let agent = Agent {
