@@ -43,12 +43,20 @@ jobs:
 
           release=false
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "david") | .version')"
+          latest_tag="$(git tag --sort=-version:refname --list 'v*' | head -n1)"
 
-          if ! git tag --list 'v*' | grep -q .; then
+          if [[ -z "$latest_tag" ]]; then
             if [[ "$version" != "1.0.0" ]]; then
               echo "initial release must start at 1.0.0, found ${version}" >&2
               exit 1
             fi
+            release=true
+          elif ! git show "${latest_tag}:Cargo.toml" | grep -Fx 'name = "david"' >/dev/null; then
+            if [[ "$version" != "1.0.1" ]]; then
+              echo "first david release after legacy ${latest_tag} must start at 1.0.1, found ${version}" >&2
+              exit 1
+            fi
+            echo "bootstrapping david ${version} after legacy tag ${latest_tag}"
             release=true
           else
             release-plz update --config release-plz.toml

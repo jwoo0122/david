@@ -24,7 +24,7 @@ How should a change merged to `main` become a coordinated Cargo, GitHub, and Hom
 
 ## Current decision
 
-The project MUST use `1.0.0` as its initial package version. A workflow triggered by pushes to `main` MUST use release-plz's Conventional Commit analysis to decide whether a new version is needed. `feat` commits MUST increment minor, `fix` and `perf` commits MUST increment patch, and a `BREAKING CHANGE` footer or `!` marker MUST increment major. `docs`, `chore`, `test`, and `refactor` commits MUST not create a release unless they carry a breaking-change marker.
+The `david` package MUST use `1.0.1` as its initial version because the existing `v1.0.0` tag belongs to the historical `tony` package. A workflow triggered by pushes to `main` MUST bootstrap `david` at `v1.0.1` when the newest version tag does not contain the `david` package, without deleting or reusing that legacy tag. After the first `david` tag, the workflow MUST use release-plz's Conventional Commit analysis to decide whether a new version is needed. `feat` commits MUST increment minor, `fix` and `perf` commits MUST increment patch, and a `BREAKING CHANGE` footer or `!` marker MUST increment major. `docs`, `chore`, `test`, and `refactor` commits MUST not create a release unless they carry a breaking-change marker.
 
 When a release is needed, the workflow MUST commit the resulting manifest version as `chore(release): v<version>` and create the matching `v<version>` tag. The release commit MUST be the source revision for the release.
 
@@ -45,6 +45,7 @@ The project needs a single release source of truth while keeping the user-facing
 - Homebrew MUST install prebuilt artifacts and MUST not require Rust at installation time.
 - The formula MUST be written only to `jwoo0122/homebrew-tap` at `Formula/david.rb`.
 - The public Cargo package and Homebrew formula identity MUST be `david`; previously published `tony` artifacts remain historical and are not silently republished under the new name.
+- A version tag whose manifest identifies a historical package name MUST NOT be treated as `david` release history.
 - The workflow MUST fail closed when its required repository secrets are unavailable; no fallback token or checked-in credential is allowed.
 
 ## Alternatives and trade-offs
@@ -55,11 +56,11 @@ The project needs a single release source of truth while keeping the user-facing
 
 ## Consequences
 
-Every qualifying push can add a bot-authored commit to `main`. A failed package or tap publication can leave a GitHub Release partially complete. Crates.io publication can be retried with the manual `Publish crate` workflow for the existing release commit and version. The first `main` push after this pipeline is installed bootstraps `v1.0.0` even if the preceding development commits were not Conventional Commits. Existing `tony` installations are not upgraded by the new package name and remain on their historical package and formula identities.
+Every qualifying push can add a bot-authored commit to `main`. A failed package or tap publication can leave a GitHub Release partially complete. Crates.io publication can be retried with the manual `Publish crate` workflow for the existing release commit and version. The first `main` push for the rebranded package bootstraps `v1.0.1` after the historical `tony` tag, even if the preceding development commits were not Conventional Commits. Existing `tony` installations are not upgraded by the new package name and remain on their historical package and formula identities.
 
 ## Enforcement
 
-CI configuration checks MUST verify the release-plz filter, initial `1.0.0` bootstrap, `david` package identity, version-bump commit format, tag/ref handoff, secret names, target list, Homebrew tap path, and crate recovery workflow. `dist plan --tag v1.0.0` MUST succeed locally. The ordinary Rust test, format, clippy, and locked release-build checks MUST remain green.
+CI configuration checks MUST verify the release-plz filter, legacy-tag `1.0.1` bootstrap, `david` package identity, version-bump commit format, tag/ref handoff, secret names, target list, Homebrew tap path, and crate recovery workflow. `dist plan --tag v1.0.1` MUST succeed locally. The ordinary Rust test, format, clippy, and locked release-build checks MUST remain green.
 
 ## Revisit when
 
