@@ -12,7 +12,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::{
+    ffi::{OsStrExt, OsStringExt},
+    fs::{DirBuilderExt, OpenOptionsExt},
+};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ToolError>;
@@ -156,10 +159,10 @@ impl SessionState {
 
     fn encode(&self) -> String {
         let mut encoded = format!(
-            "repo_id={}\nworktree_name={}\nworktree_path={}\nbranch={}\nsession={}\nagent={}\n",
+            "repo_id={}\nworktree_name={}\nworktree_path_hex={}\nbranch={}\nsession={}\nagent={}\n",
             self.repo_id,
             self.worktree_name,
-            self.worktree_path.display(),
+            encode_path_hex(&self.worktree_path),
             self.branch,
             self.session,
             self.agent
@@ -204,7 +207,11 @@ impl Config {
             ));
         }
         for (name, agent) in &self.agents {
-            if name.trim().is_empty() || name.contains('\n') || name.contains('\r') {
+            if name.trim().is_empty()
+                || name.contains('\n')
+                || name.contains('\r')
+                || name.contains('\0')
+            {
                 return Err(ToolError::Message(
                     "agent names must be non-empty single-line values".to_owned(),
                 ));
@@ -212,9 +219,15 @@ impl Config {
             if agent.command.trim().is_empty()
                 || agent.command.contains('\n')
                 || agent.command.contains('\r')
+                || agent.command.contains('\0')
             {
                 return Err(ToolError::Message(format!(
                     "agent {name:?} must define a non-empty single-line command"
+                )));
+            }
+            if agent.args.iter().any(|argument| argument.contains('\0')) {
+                return Err(ToolError::Message(format!(
+                    "agent {name:?} arguments must not contain NUL bytes"
                 )));
             }
         }
@@ -420,9 +433,9 @@ impl Git {
 
     fn worktrees(&self, root: &Path) -> Result<Vec<Worktree>> {
         let mut command = self.command(root);
-        command.args(["worktree", "list", "--porcelain"]);
+        command.args(["worktree", "list", "--porcelain", "-z"]);
         let output = self.output(command)?;
-        Ok(parse_worktree_list(&text(&output.stdout)))
+        Ok(parse_worktree_list_bytes(&output.stdout))
     }
 
     fn add_worktree(&self, root: &Path, name: &str, path: &Path) -> Result<()> {
@@ -477,6 +490,69 @@ pub struct Worktree {
     pub branch: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionStatus {
+    Active,
+    Inactive,
+    Unknown,
+}
+
+impl SessionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Inactive => "inactive",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ManagedWorktree {
+    name: String,
+    branch: String,
+    agent: String,
+    session: SessionStatus,
+    path: PathBuf,
+}
+
+pub fn parse_worktree_list_bytes(input: &[u8]) -> Vec<Worktree> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<Worktree> = None;
+
+    let mut finish = |current: &mut Option<Worktree>| {
+        if let Some(worktree) = current.take() {
+            worktrees.push(worktree);
+        }
+    };
+
+    for field in input.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            finish(&mut current);
+            continue;
+        }
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            finish(&mut current);
+            current = Some(Worktree {
+                path: path_from_bytes(path),
+                head: String::new(),
+                branch: None,
+            });
+        } else if let Some(head) = field.strip_prefix(b"HEAD ") {
+            if let Some(worktree) = current.as_mut() {
+                worktree.head = String::from_utf8_lossy(head).into_owned();
+            }
+        } else if let Some(branch) = field.strip_prefix(b"branch ")
+            && let Some(worktree) = current.as_mut()
+        {
+            let branch = branch.strip_prefix(b"refs/heads/").unwrap_or(branch);
+            worktree.branch = Some(String::from_utf8_lossy(branch).into_owned());
+        }
+    }
+    finish(&mut current);
+    worktrees
+}
+
 pub fn parse_worktree_list(input: &str) -> Vec<Worktree> {
     let mut worktrees = Vec::new();
     let mut current: Option<Worktree> = None;
@@ -516,6 +592,92 @@ pub fn parse_worktree_list(input: &str) -> Vec<Worktree> {
     }
     finish(&mut current);
     worktrees
+}
+
+fn write_porcelain_list<W: Write>(
+    entries: &[ManagedWorktree],
+    zero: bool,
+    output: &mut W,
+) -> Result<()> {
+    let delimiter = if zero { b'\0' } else { b'\n' };
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            output.write_all(&[delimiter])?;
+        }
+        write_porcelain_field(output, b"name ", &entry.name, delimiter)?;
+        write_porcelain_field(output, b"branch ", &entry.branch, delimiter)?;
+        write_porcelain_field(output, b"agent ", &entry.agent, delimiter)?;
+        write_porcelain_field(output, b"session ", entry.session.as_str(), delimiter)?;
+        output.write_all(b"path ")?;
+        #[cfg(unix)]
+        output.write_all(entry.path.as_os_str().as_bytes())?;
+        #[cfg(not(unix))]
+        output.write_all(entry.path.to_string_lossy().as_bytes())?;
+        output.write_all(&[delimiter])?;
+    }
+    Ok(())
+}
+
+fn write_porcelain_field<W: Write>(
+    output: &mut W,
+    key: &[u8],
+    value: &str,
+    delimiter: u8,
+) -> io::Result<()> {
+    output.write_all(key)?;
+    output.write_all(value.as_bytes())?;
+    output.write_all(&[delimiter])
+}
+
+fn encode_path_hex(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let path = path.to_string_lossy();
+    #[cfg(not(unix))]
+    let bytes = path.as_bytes();
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+fn decode_path_hex(value: &str) -> Option<PathBuf> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        decoded.push((high << 4) | low);
+    }
+    Some(path_from_bytes(&decoded))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 pub trait SessionBackend {
@@ -1447,15 +1609,64 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
     }
 
     pub fn list<W: Write>(&self, cwd: &Path, output: &mut W) -> Result<()> {
+        let entries = self.managed_worktrees(cwd)?;
+
+        writeln!(output, "NAME\tBRANCH\tAGENT\tPATH")?;
+        for entry in &entries {
+            writeln!(
+                output,
+                "{}\t{}\t{}\t{}",
+                entry.name,
+                entry.branch,
+                entry.agent,
+                entry.path.display()
+            )?;
+        }
+        if entries.is_empty() {
+            writeln!(output, "No managed worktrees.")?;
+        }
+        Ok(())
+    }
+
+    pub fn list_porcelain<W: Write>(&self, cwd: &Path, zero: bool, output: &mut W) -> Result<()> {
+        let entries = self.managed_worktrees(cwd)?;
+        write_porcelain_list(&entries, zero, output)
+    }
+
+    pub fn path<W: Write>(&self, cwd: &Path, name: &str, zero: bool, output: &mut W) -> Result<()> {
+        validate_worktree_name(name)?;
+
+        let root = self.git.repository_root(cwd)?;
+        let repo_id = self.git.repository_id(&root)?;
+        let target = self.paths.worktree_path(&repo_id, name);
+        self.paths.validate_worktree_path(&repo_id, name)?;
+        let worktree = self.find_worktree(&root, &target)?.ok_or_else(|| {
+            ToolError::Message(format!("managed worktree does not exist: {name}"))
+        })?;
+        if worktree.branch.as_deref() != Some(name) {
+            return Err(ToolError::Message(format!(
+                "managed worktree {name} is not attached to its expected branch"
+            )));
+        }
+
+        let path = fs::canonicalize(&worktree.path)?;
+        #[cfg(unix)]
+        output.write_all(path.as_os_str().as_bytes())?;
+        #[cfg(not(unix))]
+        output.write_all(path.to_string_lossy().as_bytes())?;
+        output.write_all(&[if zero { b'\0' } else { b'\n' }])?;
+        Ok(())
+    }
+
+    fn managed_worktrees(&self, cwd: &Path) -> Result<Vec<ManagedWorktree>> {
         self.sessions.ensure_available()?;
         let root = self.git.repository_root(cwd)?;
         let repo_id = self.git.repository_id(&root)?;
         let base = self.paths.repository_worktrees(&repo_id);
         let base = fs::canonicalize(&base).unwrap_or(base);
         let worktrees = self.git.worktrees(&root)?;
+        let mut entries = Vec::new();
 
-        writeln!(output, "NAME\tBRANCH\tAGENT\tPATH")?;
-        let mut count = 0;
         for worktree in worktrees {
             let Some(relative) = worktree.path.strip_prefix(&base).ok() else {
                 continue;
@@ -1467,52 +1678,62 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             if self.paths.validate_worktree_path(&repo_id, &name).is_err() {
                 continue;
             }
-            let session = session_name(&repo_id, &name);
-            let state_path = self.paths.session_state_path(&repo_id, &name);
-            let agent = if state_path.is_file() {
-                if self.sessions.has_session(&session)? {
-                    let state = read_session_state(&state_path)?;
-                    if !state.matches(&repo_id, &name, &worktree.path, &session) {
-                        return Err(ToolError::Message(format!(
-                            "session metadata does not match managed worktree {name}"
-                        )));
-                    }
-                    let pane_alive = if let Some(pane) = state.pane.as_deref() {
-                        self.sessions
-                            .pane_is_alive(&session, pane)
-                            .unwrap_or_default()
-                    } else {
-                        match self.sessions.agent_pane(&session) {
-                            Ok(Some(pane)) => self
-                                .sessions
-                                .pane_is_alive(&session, &pane)
-                                .unwrap_or_default(),
-                            Ok(None) | Err(_) => false,
-                        }
-                    };
-                    if pane_alive {
-                        state.agent
-                    } else {
-                        "-".to_owned()
-                    }
-                } else {
-                    "-".to_owned()
-                }
-            } else {
-                "-".to_owned()
-            };
-            let branch = worktree.branch.as_deref().unwrap_or("(detached)");
-            writeln!(
-                output,
-                "{name}\t{branch}\t{agent}\t{}",
-                worktree.path.display()
-            )?;
-            count += 1;
+            let (agent, session) = self.session_status(&repo_id, &name, &worktree.path)?;
+            entries.push(ManagedWorktree {
+                name,
+                branch: worktree
+                    .branch
+                    .as_deref()
+                    .unwrap_or("(detached)")
+                    .to_owned(),
+                agent,
+                session,
+                path: worktree.path,
+            });
         }
-        if count == 0 {
-            writeln!(output, "No managed worktrees.")?;
+        Ok(entries)
+    }
+
+    fn session_status(
+        &self,
+        repo_id: &str,
+        name: &str,
+        worktree_path: &Path,
+    ) -> Result<(String, SessionStatus)> {
+        let session = session_name(repo_id, name);
+        let state_path = self.paths.session_state_path(repo_id, name);
+        if !state_path.is_file() {
+            return Ok(("-".to_owned(), SessionStatus::Unknown));
         }
-        Ok(())
+        if !self.sessions.has_session(&session)? {
+            return Ok(("-".to_owned(), SessionStatus::Inactive));
+        }
+
+        let state = read_session_state(&state_path)?;
+        if !state.matches(repo_id, name, worktree_path, &session) {
+            return Err(ToolError::Message(format!(
+                "session metadata does not match managed worktree {name}"
+            )));
+        }
+        let pane_alive = if let Some(pane) = state.pane.as_deref() {
+            self.sessions
+                .pane_is_alive(&session, pane)
+                .unwrap_or_default()
+        } else {
+            match self.sessions.agent_pane(&session) {
+                Ok(Some(pane)) => self
+                    .sessions
+                    .pane_is_alive(&session, &pane)
+                    .unwrap_or_default(),
+                Ok(None) | Err(_) => false,
+            }
+        };
+        let agent = if pane_alive {
+            state.agent
+        } else {
+            "-".to_owned()
+        };
+        Ok((agent, SessionStatus::Active))
     }
 
     pub fn remove(&self, cwd: &Path, name: &str, force: bool) -> Result<()> {
@@ -1713,7 +1934,14 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
         };
         if !matches!(
             key,
-            "repo_id" | "worktree_name" | "worktree_path" | "branch" | "session" | "agent" | "pane"
+            "repo_id"
+                | "worktree_name"
+                | "worktree_path"
+                | "worktree_path_hex"
+                | "branch"
+                | "session"
+                | "agent"
+                | "pane"
         ) {
             return Err(ToolError::Message(format!(
                 "session metadata contains unknown field {key}: {}",
@@ -1736,12 +1964,32 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
         })
     };
     let agent = take("agent")?;
-    if agent.trim().is_empty() || agent.contains('\n') || agent.contains('\r') {
+    if agent.trim().is_empty()
+        || agent.contains('\n')
+        || agent.contains('\r')
+        || agent.contains('\0')
+    {
         return Err(ToolError::Message(format!(
             "session metadata has an invalid agent: {}",
             path.display()
         )));
     }
+    let worktree_path = if let Some(encoded) = values.get("worktree_path_hex") {
+        if values.contains_key("worktree_path") {
+            return Err(ToolError::Message(format!(
+                "session metadata contains duplicate worktree path fields: {}",
+                path.display()
+            )));
+        }
+        decode_path_hex(encoded).ok_or_else(|| {
+            ToolError::Message(format!(
+                "session metadata has an invalid worktree path: {}",
+                path.display()
+            ))
+        })?
+    } else {
+        PathBuf::from(take("worktree_path")?)
+    };
     let pane = values.get("pane").cloned();
     if let Some(pane) = &pane
         && !valid_pane_id(pane)
@@ -1754,7 +2002,7 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
     Ok(SessionState {
         repo_id: take("repo_id")?,
         worktree_name: take("worktree_name")?,
-        worktree_path: PathBuf::from(take("worktree_path")?),
+        worktree_path,
         branch: take("branch")?,
         session: take("session")?,
         agent,
@@ -2087,6 +2335,7 @@ mod tests {
             &["config", "user.email", "test@example.com"],
         );
         run_git(directory.path(), &["config", "user.name", "Test"]);
+        run_git(directory.path(), &["config", "commit.gpgSign", "false"]);
         fs::write(directory.path().join("README.md"), "initial\n").unwrap();
         run_git(directory.path(), &["add", "."]);
         run_git(directory.path(), &["commit", "-qm", "initial"]);
@@ -2170,6 +2419,93 @@ mod tests {
         assert_eq!(read_session_state(&path).unwrap().pane, None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn session_state_hex_encodes_paths_and_reads_legacy_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.state");
+        let worktree_path = PathBuf::from(OsString::from_vec(
+            b"/tmp/feature\nwith-newline-\xff".to_vec(),
+        ));
+        let state = SessionState {
+            repo_id: "repo".to_owned(),
+            worktree_name: "feature".to_owned(),
+            worktree_path,
+            branch: "feature".to_owned(),
+            session: "david-repo-feature".to_owned(),
+            agent: "test".to_owned(),
+            pane: None,
+        };
+
+        write_session_state(&path, &state).unwrap();
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(encoded.contains(
+            "worktree_path_hex=2f746d702f666561747572650a776974682d6e65776c696e652dff\n"
+        ));
+        assert!(!encoded.contains("worktree_path=/tmp"));
+        assert_eq!(read_session_state(&path).unwrap(), state);
+
+        fs::write(
+            &path,
+            "repo_id=repo\nworktree_name=feature\nworktree_path=/tmp/legacy\nbranch=feature\nsession=david-repo-feature\nagent=test\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_session_state(&path).unwrap().worktree_path,
+            PathBuf::from("/tmp/legacy")
+        );
+    }
+
+    #[test]
+    fn rejects_nul_in_agent_configuration_and_session_state_values() {
+        let config = |name: &str, agent: Agent| Config {
+            agents: BTreeMap::from([(name.to_owned(), agent)]),
+        };
+        assert!(
+            config(
+                "bad\0name",
+                Agent {
+                    command: "echo".to_owned(),
+                    args: vec![],
+                }
+            )
+            .validate()
+            .is_err()
+        );
+        assert!(
+            config(
+                "test",
+                Agent {
+                    command: "ec\0ho".to_owned(),
+                    args: vec![],
+                }
+            )
+            .validate()
+            .is_err()
+        );
+        assert_eq!(
+            config(
+                "test",
+                Agent {
+                    command: "echo".to_owned(),
+                    args: vec!["bad\0arg".to_owned()],
+                }
+            )
+            .validate()
+            .unwrap_err()
+            .to_string(),
+            "agent \"test\" arguments must not contain NUL bytes"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.state");
+        fs::write(
+            &path,
+            "repo_id=repo\nworktree_name=feature\nworktree_path=/tmp/feature\nbranch=feature\nsession=david-repo-feature\nagent=bad\0agent\n",
+        )
+        .unwrap();
+        assert!(read_session_state(&path).is_err());
+    }
+
     #[test]
     fn parses_porcelain_worktree_output() {
         let worktrees = parse_worktree_list(
@@ -2178,6 +2514,58 @@ mod tests {
         assert_eq!(worktrees.len(), 2);
         assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
         assert_eq!(worktrees[1].head, "def");
+    }
+
+    #[test]
+    fn parses_nul_porcelain_worktree_output_without_splitting_newline_paths() {
+        let input = b"worktree /tmp/feature\nwith-newline\0HEAD def\0branch refs/heads/feature\0\0";
+
+        let worktrees = parse_worktree_list_bytes(input);
+
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(
+            worktrees[0].path,
+            PathBuf::from("/tmp/feature\nwith-newline")
+        );
+        assert_eq!(worktrees[0].branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn porcelain_formatter_uses_exact_newline_and_nul_record_delimiters() {
+        let entries = vec![
+            ManagedWorktree {
+                name: "first".to_owned(),
+                branch: "main".to_owned(),
+                agent: "codex".to_owned(),
+                session: SessionStatus::Active,
+                path: PathBuf::from("/tmp/first"),
+            },
+            ManagedWorktree {
+                name: "second".to_owned(),
+                branch: "(detached)".to_owned(),
+                agent: "-".to_owned(),
+                session: SessionStatus::Unknown,
+                path: PathBuf::from("/tmp/second\nwith-newline"),
+            },
+        ];
+
+        let mut newline = Vec::new();
+        write_porcelain_list(&entries, false, &mut newline).unwrap();
+        assert_eq!(
+            String::from_utf8(newline).unwrap(),
+            "name first\nbranch main\nagent codex\nsession active\npath /tmp/first\n\nname second\nbranch (detached)\nagent -\nsession unknown\npath /tmp/second\nwith-newline\n"
+        );
+
+        let mut nul = Vec::new();
+        write_porcelain_list(&entries, true, &mut nul).unwrap();
+        assert_eq!(
+            nul,
+            b"name first\0branch main\0agent codex\0session active\0path /tmp/first\0\0name second\0branch (detached)\0agent -\0session unknown\0path /tmp/second\nwith-newline\0"
+        );
+
+        let mut empty = Vec::new();
+        write_porcelain_list(&[], false, &mut empty).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
@@ -2670,6 +3058,106 @@ mod tests {
     }
 
     #[test]
+    fn human_list_preserves_header_and_row_bytes() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let app = test_app(paths.clone(), FakeSessions::default());
+        app.run(repo.path(), "feature").unwrap();
+
+        let target = paths.worktree_path(
+            &Git::default().repository_id(repo.path()).unwrap(),
+            "feature",
+        );
+        let target = fs::canonicalize(target).unwrap();
+        let mut output = Vec::new();
+        app.list(repo.path(), &mut output).unwrap();
+        let expected = format!(
+            "NAME\tBRANCH\tAGENT\tPATH\nfeature\tfeature\ttest\t{}\n",
+            target.display()
+        );
+        assert_eq!(output, expected.as_bytes());
+    }
+
+    #[test]
+    fn porcelain_list_reports_unknown_inactive_and_active_sessions() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "active").unwrap();
+        app.run(repo.path(), "inactive").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        sessions
+            .state
+            .borrow_mut()
+            .live
+            .remove(&session_name(&repo_id, "inactive"));
+
+        let unknown = paths.worktree_path(&repo_id, "unknown");
+        fs::create_dir_all(unknown.parent().unwrap()).unwrap();
+        app.git
+            .add_worktree(repo.path(), "unknown", &unknown)
+            .unwrap();
+
+        let mut output = Vec::new();
+        app.list_porcelain(repo.path(), false, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("name active\nbranch active\nagent test\nsession active\n"));
+        assert!(output.contains("name inactive\nbranch inactive\nagent -\nsession inactive\n"));
+        assert!(output.contains("name unknown\nbranch unknown\nagent -\nsession unknown\n"));
+    }
+
+    #[test]
+    fn path_prints_only_the_absolute_managed_worktree_path() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+        app.run(repo.path(), "feature").unwrap();
+
+        let target = paths.worktree_path(
+            &Git::default().repository_id(repo.path()).unwrap(),
+            "feature",
+        );
+        let expected = fs::canonicalize(target).unwrap();
+        let mut output = Vec::new();
+        app.path(repo.path(), "feature", false, &mut output)
+            .unwrap();
+
+        let mut expected_output = expected.as_os_str().to_string_lossy().into_owned();
+        expected_output.push('\n');
+        assert_eq!(output, expected_output.as_bytes());
+    }
+
+    #[test]
+    fn path_rejects_missing_and_mismatched_worktrees() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+        let missing = app.path(repo.path(), "missing", false, &mut Vec::new());
+        assert!(missing.is_err());
+
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        app.git.add_worktree(repo.path(), "other", &target).unwrap();
+
+        let mismatched = app.path(repo.path(), "feature", false, &mut Vec::new());
+        assert!(
+            mismatched
+                .unwrap_err()
+                .to_string()
+                .contains("expected branch")
+        );
+    }
+
+    #[test]
     fn tmux_backend_configures_managed_session_affordances_when_tmux_is_available() {
         let Ok(available) = Command::new("tmux").arg("-V").output() else {
             return;
@@ -2678,7 +3166,11 @@ mod tests {
             return;
         }
 
-        let session = format!("david-test-{}-{}", std::process::id(), stable_hash("tmux"));
+        let session = format!(
+            "david-test-{}-{}",
+            std::process::id(),
+            stable_hash("tmux-configure")
+        );
         let directory = tempfile::tempdir().unwrap();
         let backend = TmuxBackend::default();
         let agent = Agent {
@@ -2788,6 +3280,56 @@ mod tests {
 
         assert!(output.contains("feature\tfeature\t-\t"));
         assert!(!output.contains("feature\tfeature\ttest\t"));
+
+        let mut porcelain = Vec::new();
+        app.list_porcelain(repo.path(), false, &mut porcelain)
+            .unwrap();
+        let porcelain = String::from_utf8(porcelain).unwrap();
+        assert!(porcelain.contains("agent -\nsession active\n"));
+    }
+
+    #[test]
+    fn porcelain_list_keeps_a_live_session_active_when_pane_query_fails() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = PaneSessions::default();
+        let app = App::with_picker(paths.clone(), sessions.clone(), FirstAgentPicker);
+
+        app.run(repo.path(), "feature").unwrap();
+        sessions.state.borrow_mut().pane_error = Some("pane query failed".to_owned());
+
+        let mut output = Vec::new();
+        app.list_porcelain(repo.path(), false, &mut output).unwrap();
+        let target = paths.worktree_path(
+            &Git::default().repository_id(repo.path()).unwrap(),
+            "feature",
+        );
+        let target = fs::canonicalize(target).unwrap();
+        let expected = format!(
+            "name feature\nbranch feature\nagent -\nsession active\npath {}\n",
+            target.display()
+        );
+        assert_eq!(output, expected.as_bytes());
+    }
+
+    #[test]
+    fn porcelain_list_does_not_mark_an_unmanaged_live_session_active() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        fs::remove_file(paths.session_state_path(&repo_id, "feature")).unwrap();
+
+        let mut output = Vec::new();
+        app.list_porcelain(repo.path(), false, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("agent -\nsession unknown\n"));
+        assert!(!output.contains("session active\n"));
     }
 
     #[test]
@@ -3372,7 +3914,11 @@ mod tests {
             return;
         }
 
-        let session = format!("david-test-{}-{}", std::process::id(), stable_hash("tmux"));
+        let session = format!(
+            "david-test-{}-{}",
+            std::process::id(),
+            stable_hash("tmux-manages")
+        );
         let directory = tempfile::tempdir().unwrap();
         let backend = TmuxBackend::default();
         let agent = Agent {
