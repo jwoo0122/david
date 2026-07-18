@@ -36,7 +36,7 @@ Manually creating a hidden directory and TOML file is unnecessary first-run fric
 - Setup MUST NOT require the current directory to be inside a Git repository.
 - Setup MUST NOT require tmux or execute configured agent commands.
 - Existing configured agents MUST remain unless their names are explicitly re-entered.
-- The agent name, command, and parsed arguments MUST be written to the existing TOML schema.
+- The agent name, command, and parsed arguments MUST be written to the existing TOML schema. An optional `default_agent` value MUST be preserved when setup merges and rewrites configuration, and runtime loading MUST reject it when it does not name a configured agent.
 - A setup session with no configured agents MUST fail without writing an unusable configuration.
 - The resulting configuration MUST be stored at `~/.david/config.toml` and the managed state directories MUST be scaffolded.
 

@@ -24,7 +24,7 @@ Where does the CLI store managed worktrees, and what lifecycle does a named work
 
 The CLI MUST store managed worktree checkouts below `~/.david/worktrees/<repo-id>/<worktree-name>`. The repository identity MUST include a stable identifier derived from the canonical Git common directory so linked worktrees of one repository share an identity while separate clones cannot collide.
 
-`run <worktree-name>` MUST create the named worktree from the current `HEAD` on a new branch with the same name when it does not exist, and MUST reuse it when it does exist. The source repository MUST be clean before creation. `remove <worktree-name>` MUST refuse a dirty worktree unless `--force` is supplied, then MUST delete the paired branch after removing the worktree. A later `run` with the same name therefore creates a fresh branch from the then-current `HEAD`.
+`run <worktree-name>` MUST create the named worktree from the current `HEAD` on a new branch with the same name when it does not exist, and MUST reuse it when it does exist. The source repository MUST be clean before creation. A managed worktree normally reports that same branch, but an in-progress rebase may temporarily report detached HEAD; that state is valid only for reattaching to its already-live matching managed session, not for creating or starting a replacement session. `remove <worktree-name>` MUST refuse a dirty worktree unless `--force` is supplied, then MUST delete the paired branch after removing the worktree. A later `run` with the same name therefore creates a fresh branch from the then-current `HEAD`.
 
 ## Context and forces
 
@@ -38,7 +38,8 @@ The command is intentionally unified so callers do not need to distinguish creat
 - Repository identity MUST distinguish canonical Git common directories with the same basename.
 - Invocations from linked worktrees MUST resolve to the same repository identity as invocations from the main worktree.
 - Creation MUST use the current `HEAD` and a new branch named for the worktree.
-- The worktree name and its branch name MUST match.
+- The worktree name and its branch name MUST match whenever Git reports an attached branch.
+- A detached worktree MUST not be treated as its expected branch unless an in-progress rebase records that branch and a matching managed session is already live.
 - A dirty source repository MUST not be used to create a managed worktree.
 - Default removal MUST leave a dirty worktree and its process state untouched.
 - Removal MUST delete the paired branch only after the worktree has been removed.
@@ -58,7 +59,7 @@ The CLI owns a predictable user-level storage tree and can find managed state wi
 
 ## Enforcement
 
-Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, dirty-source rejection, reuse, dirty-removal rejection, branch deletion, and explicit forced removal.
+Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, rebase-detached session reattachment, arbitrary-detached and wrong-branch rejection, dirty-source rejection, reuse, dirty-removal rejection, branch deletion, and explicit forced removal.
 
 ## Revisit when
 
