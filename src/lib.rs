@@ -2257,7 +2257,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         let session = session_name(&repo_id, name);
         let state_path = self.paths.session_state_path(&repo_id, name);
         let live = self.sessions.has_session(&session)?;
-        if state_path.is_file() {
+        let metadata_valid = if state_path.is_file() {
             let state = read_session_state(&state_path)?;
             if !state.matches(&repo_id, name, &target, &session) {
                 return Err(ToolError::Message(format!(
@@ -2273,12 +2273,15 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 self.sessions
                     .validate_session_metadata(&session, &metadata)?;
             }
+            true
         } else if live {
             return Err(ToolError::Message(format!(
                 "tmux session {session} exists but is not managed by david"
             )));
-        }
-        if live {
+        } else {
+            false
+        };
+        if live || metadata_valid {
             self.sessions.kill_session(&session)?;
             if self.sessions.has_session(&session)? {
                 return Err(ToolError::Message(format!(
@@ -2791,7 +2794,7 @@ fn command_error(program: &str, output: &Output) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, collections::BTreeSet, process::Command, rc::Rc};
+    use std::{cell::RefCell, collections::BTreeSet, io::Write, process::Command, rc::Rc};
     use tempfile::TempDir;
 
     #[derive(Clone, Default)]
@@ -2811,6 +2814,7 @@ mod tests {
         killed: Vec<String>,
         configure_error: Option<String>,
         kill_error: Option<String>,
+        lifecycle_log: Option<PathBuf>,
         deliveries: Vec<(String, String)>,
         prompt_error: Option<String>,
     }
@@ -2881,12 +2885,18 @@ mod tests {
         }
 
         fn kill_session(&self, name: &str) -> Result<()> {
-            let mut state = self.state.borrow_mut();
-            if let Some(message) = &state.kill_error {
-                return Err(ToolError::Message(message.clone()));
+            let lifecycle_log = {
+                let mut state = self.state.borrow_mut();
+                if let Some(message) = &state.kill_error {
+                    return Err(ToolError::Message(message.clone()));
+                }
+                state.live.remove(name);
+                state.killed.push(name.to_owned());
+                state.lifecycle_log.clone()
+            };
+            if let Some(path) = lifecycle_log {
+                append_test_event(&path, "session-terminate");
             }
-            state.live.remove(name);
-            state.killed.push(name.to_owned());
             Ok(())
         }
     }
@@ -3081,6 +3091,54 @@ mod tests {
             .status()
             .expect("git command");
         assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    fn branch_exists(cwd: &Path, name: &str) -> bool {
+        Command::new("git")
+            .current_dir(cwd)
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{name}"))
+            .status()
+            .expect("git show-ref")
+            .success()
+    }
+
+    fn append_test_event(path: &Path, event: &str) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("lifecycle log");
+        writeln!(file, "{event}").expect("lifecycle event");
+    }
+
+    #[cfg(unix)]
+    fn recording_git(
+        directory: &Path,
+        log: &Path,
+        failure: Option<&str>,
+        metadata: Option<&Path>,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn shell_quote(path: &Path) -> String {
+            format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+        }
+
+        let program = directory.join("git-wrapper");
+        let failure = failure.unwrap_or("");
+        let metadata = metadata.map(shell_quote).unwrap_or_else(|| "''".to_owned());
+        let script = format!(
+            "#!/bin/sh\nlog={}\nfailure='{}'\nmetadata={}\nif [ \"$1\" = \"worktree\" ] && [ \"$2\" = \"remove\" ]; then\n  printf '%s\\n' 'worktree-remove' >> \"$log\"\n  if [ \"$failure\" = 'worktree-remove' ]; then\n    printf '%s\\n' 'worktree remove failed' >&2\n    exit 17\n  fi\nfi\nif [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"-d\" ]; then\n  if [ -n \"$metadata\" ] && [ -e \"$metadata\" ]; then\n    printf '%s\\n' 'metadata-present' >> \"$log\"\n  fi\n  printf '%s\\n' 'branch-delete' >> \"$log\"\n  if [ \"$failure\" = 'branch-delete' ]; then\n    printf '%s\\n' 'branch delete failed' >&2\n    exit 19\n  fi\nfi\nexec \"$(command -v git)\" \"$@\"\n",
+            shell_quote(log),
+            failure,
+            metadata
+        );
+        fs::write(&program, script).expect("git wrapper");
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+        program
     }
 
     fn git_stdout(cwd: &Path, args: &[&str]) -> String {
@@ -4103,6 +4161,57 @@ mod tests {
     }
 
     #[test]
+    fn remove_deletes_a_clean_unmerged_branch_without_force() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        fs::write(target.join("branch-only.txt"), "branch-only\n").unwrap();
+        run_git(&target, &["add", "branch-only.txt"]);
+        run_git(
+            &target,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "branch-only"],
+        );
+        assert!(!Git::default().worktree_is_dirty(&target).unwrap());
+        assert!(branch_exists(repo.path(), "feature"));
+
+        app.remove(repo.path(), "feature", false).unwrap();
+
+        assert!(!target.exists());
+        assert!(!branch_exists(repo.path(), "feature"));
+        assert!(!state_path.exists());
+        assert_eq!(sessions.state.borrow().killed.len(), 1);
+    }
+
+    #[test]
+    fn remove_cleans_valid_stale_session_metadata_before_worktree_removal() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        let session = session_name(&repo_id, "feature");
+        sessions.state.borrow_mut().live.remove(&session);
+
+        app.remove(repo.path(), "feature", false).unwrap();
+
+        assert!(!target.exists());
+        assert!(!state_path.exists());
+        assert_eq!(sessions.state.borrow().killed, vec![session]);
+    }
+
+    #[test]
     fn remove_rejects_dirty_worktree_until_forced() {
         let repo = init_repo();
         let home = tempfile::tempdir().unwrap();
@@ -4111,25 +4220,22 @@ mod tests {
         let app = test_app(paths.clone(), sessions.clone());
 
         app.run(repo.path(), "feature").unwrap();
-        let target = paths.worktree_path(
-            &Git::default().repository_id(repo.path()).unwrap(),
-            "feature",
-        );
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        let state_path = paths.session_state_path(&repo_id, "feature");
         fs::write(target.join("uncommitted.txt"), "change\n").unwrap();
 
         assert!(app.remove(repo.path(), "feature", false).is_err());
         assert!(target.exists());
+        assert!(branch_exists(repo.path(), "feature"));
+        assert!(state_path.exists());
         assert_eq!(sessions.state.borrow().killed.len(), 0);
 
         app.remove(repo.path(), "feature", true).unwrap();
         assert!(!target.exists());
+        assert!(!branch_exists(repo.path(), "feature"));
+        assert!(!state_path.exists());
         assert_eq!(sessions.state.borrow().killed.len(), 1);
-        let branch = Command::new("git")
-            .current_dir(repo.path())
-            .args(["show-ref", "--verify", "--quiet", "refs/heads/feature"])
-            .status()
-            .unwrap();
-        assert!(!branch.success());
 
         app.run(repo.path(), "feature").unwrap();
         assert!(target.is_dir());
@@ -4137,6 +4243,168 @@ mod tests {
 
         app.remove(&target, "feature", true).unwrap();
         assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_orders_session_termination_worktree_removal_atomic_branch_deletion_and_metadata_cleanup()
+     {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        let lifecycle_log = home.path().join("lifecycle.log");
+        let git_wrapper = recording_git(home.path(), &lifecycle_log, None, Some(&state_path));
+        let sessions = FakeSessions::default();
+        sessions.state.borrow_mut().lifecycle_log = Some(lifecycle_log.clone());
+        let mut app = test_app(paths.clone(), sessions.clone());
+        app.git = Git::new(git_wrapper.as_os_str().to_owned());
+
+        app.run(repo.path(), "feature").unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        fs::write(&lifecycle_log, "").unwrap();
+
+        app.remove(repo.path(), "feature", false).unwrap();
+
+        let events = fs::read_to_string(&lifecycle_log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            vec![
+                "session-terminate",
+                "worktree-remove",
+                "metadata-present",
+                "branch-delete"
+            ]
+        );
+        assert!(!target.exists());
+        assert!(!branch_exists(repo.path(), "feature"));
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn remove_stops_before_failure_and_leaves_later_resources_untouched() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        let session = session_name(&repo_id, "feature");
+        sessions.state.borrow_mut().kill_error = Some("kill failed".to_owned());
+
+        let error = app.remove(repo.path(), "feature", false).unwrap_err();
+
+        assert!(error.to_string().contains("kill failed"));
+        assert!(sessions.state.borrow().live.contains(&session));
+        assert!(target.exists());
+        assert!(branch_exists(repo.path(), "feature"));
+        assert!(state_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_keeps_worktree_branch_and_metadata_when_worktree_removal_fails() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let lifecycle_log = home.path().join("lifecycle.log");
+        let git_wrapper = recording_git(home.path(), &lifecycle_log, Some("worktree-remove"), None);
+        let sessions = FakeSessions::default();
+        sessions.state.borrow_mut().lifecycle_log = Some(lifecycle_log.clone());
+        let mut app = test_app(paths.clone(), sessions.clone());
+        app.git = Git::new(git_wrapper.as_os_str().to_owned());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        fs::write(&lifecycle_log, "").unwrap();
+
+        let error = app.remove(repo.path(), "feature", false).unwrap_err();
+
+        assert!(error.to_string().contains("worktree remove failed"));
+        assert_eq!(
+            fs::read_to_string(&lifecycle_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["session-terminate", "worktree-remove"]
+        );
+        assert!(sessions.state.borrow().live.is_empty());
+        assert!(target.exists());
+        assert!(branch_exists(repo.path(), "feature"));
+        assert!(state_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_keeps_branch_and_metadata_when_atomic_branch_deletion_fails() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let lifecycle_log = home.path().join("lifecycle.log");
+        let git_wrapper = recording_git(home.path(), &lifecycle_log, Some("branch-delete"), None);
+        let sessions = FakeSessions::default();
+        sessions.state.borrow_mut().lifecycle_log = Some(lifecycle_log.clone());
+        let mut app = test_app(paths.clone(), sessions.clone());
+        app.git = Git::new(git_wrapper.as_os_str().to_owned());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        fs::write(&lifecycle_log, "").unwrap();
+
+        let error = app.remove(repo.path(), "feature", false).unwrap_err();
+
+        assert!(error.to_string().contains("branch delete failed"));
+        assert_eq!(
+            fs::read_to_string(&lifecycle_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["session-terminate", "worktree-remove", "branch-delete"]
+        );
+        assert!(sessions.state.borrow().live.is_empty());
+        assert!(!target.exists());
+        assert!(branch_exists(repo.path(), "feature"));
+        assert!(state_path.exists());
+    }
+
+    #[test]
+    fn remove_leaves_metadata_when_metadata_cleanup_fails_after_branch_deletion() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        let state_path = paths.session_state_path(&repo_id, "feature");
+        sessions.state.borrow_mut().live.clear();
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+
+        let error = app.remove(repo.path(), "feature", false).unwrap_err();
+
+        assert!(
+            matches!(&error, ToolError::Io(_)),
+            "unexpected metadata cleanup error: {error}"
+        );
+        assert!(!target.exists());
+        assert!(!branch_exists(repo.path(), "feature"));
+        assert!(state_path.is_dir());
     }
 
     #[test]
