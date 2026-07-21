@@ -66,6 +66,8 @@ Run from any directory inside the source Git repository:
 david run feature-login
 ```
 
+When called without a worktree name in an interactive terminal, a picker lists existing managed worktrees with their agent and session status, plus a "New worktree..." option. Selecting an existing worktree reuses or attaches to its session; selecting "New worktree..." prompts for a name, then creates the worktree and resolves the agent in the same order as below. In a non-interactive context, a worktree name is required.
+
 If the worktree does not exist, `david` creates a new branch from the current `HEAD` at:
 
 ```text
