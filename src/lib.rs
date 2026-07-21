@@ -1481,10 +1481,10 @@ impl SessionBackend for TmuxBackend {
         self.configure_key_table(name)?;
         self.set_option(name, "status", "on")?;
         self.set_option(name, "status-style", "bg=colour252,fg=colour235")?;
-        self.set_option(name, "window-style", "fg=colour237,bg=default")?;
-        self.set_option(name, "window-active-style", "fg=colour235,bg=default")?;
-        self.set_option(name, "pane-border-style", "fg=colour248,bg=default")?;
-        self.set_option(name, "pane-active-border-style", "fg=colour241,bg=default")?;
+        self.set_option(name, "window-style", "fg=default,bg=default")?;
+        self.set_option(name, "window-active-style", "fg=default,bg=default")?;
+        self.set_option(name, "pane-border-style", "fg=default,bg=default")?;
+        self.set_option(name, "pane-active-border-style", "fg=default,bg=default")?;
         self.set_option(name, "pane-border-status", "off")?;
         self.set_option(
             name,
