@@ -919,11 +919,15 @@ pub trait SessionBackend {
 #[derive(Clone, Debug)]
 pub struct TmuxBackend {
     program: OsString,
+    socket: Option<String>,
 }
 
 impl Default for TmuxBackend {
     fn default() -> Self {
-        Self::new("tmux")
+        Self {
+            program: "tmux".into(),
+            socket: Some("david".to_owned()),
+        }
     }
 }
 
@@ -931,12 +935,17 @@ impl TmuxBackend {
     pub fn new(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
+            socket: None,
         }
     }
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
-        command.args(["-f", "/dev/null"]);
+        if let Some(socket) = &self.socket {
+            command.args(["-L", socket, "-f", "/dev/null"]);
+        } else {
+            command.args(["-f", "/dev/null"]);
+        }
         command
     }
 
@@ -4700,10 +4709,13 @@ mod tests {
 
             let directory = tempfile::tempdir().unwrap();
             fs::create_dir(directory.path().join("tmux")).unwrap();
+            let socket = format!("d{}", stable_hash(label));
             let wrapper = directory.path().join("tmux-wrapper");
             fs::write(
                 &wrapper,
-                "#!/bin/sh\nunset TMUX\nexport TMUX_TMPDIR=\"$(dirname \"$0\")/tmux\"\nexec tmux \"$@\"\n",
+                format!(
+                    "#!/bin/sh\nunset TMUX\nexport TMUX_TMPDIR=\"$(dirname \"$0\")/tmux\"\nexec tmux -L {socket} \"$@\"\n"
+                ),
             )
             .unwrap();
             let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
