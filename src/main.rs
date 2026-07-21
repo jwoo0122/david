@@ -125,12 +125,16 @@ fn run() -> Result<()> {
                 Command::Attach { name } => app.attach(&cwd, &name),
                 Command::Prompt { worktree, message } => app.prompt(&cwd, &worktree, &message),
                 Command::List { porcelain, zero } => {
-                    let stdout = io::stdout();
-                    let is_terminal = stdout.is_terminal();
-                    let mut output = stdout.lock();
                     if porcelain {
+                        let stdout = io::stdout();
+                        let mut output = stdout.lock();
                         app.list_porcelain(&cwd, zero, &mut output)
+                    } else if io::stdin().is_terminal() && io::stderr().is_terminal() {
+                        app.list_interactive(&cwd)
                     } else {
+                        let stdout = io::stdout();
+                        let is_terminal = stdout.is_terminal();
+                        let mut output = stdout.lock();
                         app.list(&cwd, is_terminal, &mut output)
                     }
                 }

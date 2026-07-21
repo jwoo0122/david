@@ -8,13 +8,14 @@ applies_to:
   - tmux session creation and attach
   - prompt delivery to a managed agent session
   - list and remove process state
+  - interactive list selection
 summary: Each managed worktree owns at most one persistent tmux agent session that the CLI can attach to or prompt.
 constrains: []
 depends_on:
   - worktree.storage-and-lifecycle
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-16"
+last_reviewed: "2026-07-21"
 ---
 
 # Persistent agent sessions
@@ -35,11 +36,13 @@ During an in-progress rebase, Git may report a managed worktree as detached. Rea
 
 `prompt <worktree> <message>` MUST resolve the same managed worktree and session identity as `run`, require a live session with matching metadata, and deliver the exact received message as literal UTF-8 paste data followed by one `Enter` submission. It MUST NOT create a worktree or session, invoke the agent picker, or attach to tmux. Delivery MUST target the exact managed session and agent pane rather than the caller's current tmux target; prompt data MUST travel through tmux stdin and MUST NOT be interpreted as shell commands or tmux key names.
 
-`list` MUST report only sessions created and tracked by this CLI. Removing a worktree MUST terminate its managed tmux session before removing the checkout.
+`list` MAY present an interactive picker (arrow-key navigation + Enter) when stdin and stderr are terminals. Selecting a worktree MUST trigger the same reuse/attach/session-creation flow as `run` for an existing worktree. Non-interactive or piped input, and `--porcelain` output, MUST retain the existing non-interactive table or porcelain output. `list` MUST report only sessions created and tracked by this CLI. Removing a worktree MUST terminate its managed tmux session before removing the checkout.
 
 A managed session MUST provide a session-scoped `Ctrl-]` shortcut that detaches the client without stopping the agent. The shortcut MUST NOT replace root or prefix bindings for unrelated tmux sessions. The standard `Ctrl-b d` tmux sequence MUST remain available as a fallback. While attached, the tmux status line MUST identify the session as `DAVID` and show the project directory name, worktree name, configured agent name, and the detach shortcut.
 
-David MUST keep managed tmux configuration deterministic instead of loading arbitrary user tmux configuration. It MUST enable `mouse` for each managed session and `extended-keys` for the tmux server when configuring a managed session, both when creating and reusing it. These interaction options require tmux 3.2 or newer. `extended-keys` is server-scoped by tmux and therefore can affect other sessions sharing that server; use of a separate server is required if that side effect becomes unacceptable.
+David MUST keep managed tmux configuration deterministic instead of loading arbitrary user tmux configuration. It MUST use a dedicated tmux server socket (`-L david`) so that sessions run on a separate server that never loads `~/.tmux.conf`, eliminating global option leakage at the root. It MUST enable `mouse` for each managed session and `extended-keys` for the tmux server when configuring a managed session, both when creating and reusing it. These interaction options require tmux 3.2 or newer. `extended-keys` is server-scoped by tmux and therefore can affect other sessions sharing that server; use of a separate server is required if that side effect becomes unacceptable.
+
+A managed session MUST explicitly set the full window and pane styling (`status-style`, `window-style`, `window-active-style`, `pane-border-style`, `pane-active-border-style`) so that global tmux server options from the user's `~/.tmux.conf` do not leak into managed sessions. David creates sessions with `tmux -f /dev/null` to ignore config files, but an already-running tmux server's global options are inherited by all sessions; explicit session-scoped styling overrides prevent that leakage. The status line MUST use an achromatic (grayscale) palette with a light background and dark text, and zones MUST be distinguished by background color (lighter at edges, darker toward center) rather than pipe (`|`) separators. Window and pane backgrounds MUST use `bg=default` so the terminal default background passes through unchanged; only foreground colors and the status line background are explicitly styled.
 
 ## Context and forces
 
@@ -67,6 +70,8 @@ A directly exec'd child process is tied to the invoking terminal and cannot prov
 - Stale session metadata MUST never be reported as an active agent.
 - Removal MUST terminate the session before deleting its worktree.
 - The CLI MUST report a clear prerequisite error when tmux is unavailable.
+- A managed session MUST explicitly set window, pane, and status styling to prevent global tmux option leakage.
+- Interactive list selection MUST reuse the run flow for an existing worktree and MUST NOT create a new worktree.
 
 ## Alternatives and trade-offs
 
@@ -80,7 +85,7 @@ Users can detach with the direct `Ctrl-]` shortcut or tmux's standard `Ctrl-b d`
 
 ## Enforcement
 
-Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, deterministic agent precedence, unknown-agent and missing-selection failures, non-terminal and detach behavior, literal runtime argv, explicit attach without creation or restart, prompt delivery without attach or picker interaction, literal Unicode and multiline prompt content, missing/dead session handling, stale-session handling, tmux ownership metadata mismatch, rebase-detached reattachment, arbitrary-detached and wrong-branch rejection, list output, tmux prerequisite failure, removal ordering, serialized lifecycle operations, the managed-session status line and detach binding, and the managed mouse and extended-key options.
+Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, deterministic agent precedence, unknown-agent and missing-selection failures, non-terminal and detach behavior, literal runtime argv, explicit attach without creation or restart, prompt delivery without attach or picker interaction, literal Unicode and multiline prompt content, missing/dead session handling, stale-session handling, tmux ownership metadata mismatch, rebase-detached reattachment, arbitrary-detached and wrong-branch rejection, list output, tmux prerequisite failure, removal ordering, serialized lifecycle operations, the managed-session status line and detach binding, and the managed mouse and extended-key options. Integration tests MUST verify that session-scoped window, pane, and status styling options are explicitly set and override global defaults. Integration tests MUST verify interactive list selection triggers run-reuse for the selected worktree and non-interactive list retains table output.
 
 ## Revisit when
 

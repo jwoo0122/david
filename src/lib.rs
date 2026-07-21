@@ -919,11 +919,15 @@ pub trait SessionBackend {
 #[derive(Clone, Debug)]
 pub struct TmuxBackend {
     program: OsString,
+    socket: Option<String>,
 }
 
 impl Default for TmuxBackend {
     fn default() -> Self {
-        Self::new("tmux")
+        Self {
+            program: "tmux".into(),
+            socket: Some("david".to_owned()),
+        }
     }
 }
 
@@ -931,12 +935,17 @@ impl TmuxBackend {
     pub fn new(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
+            socket: None,
         }
     }
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
-        command.args(["-f", "/dev/null"]);
+        if let Some(socket) = &self.socket {
+            command.args(["-L", socket, "-f", "/dev/null"]);
+        } else {
+            command.args(["-f", "/dev/null"]);
+        }
         command
     }
 
@@ -1471,13 +1480,23 @@ impl SessionBackend for TmuxBackend {
         self.configure_session_options(name, metadata)?;
         self.configure_key_table(name)?;
         self.set_option(name, "status", "on")?;
+        self.set_option(name, "status-style", "bg=colour252,fg=colour235")?;
+        self.set_option(name, "window-style", "fg=default,bg=default")?;
+        self.set_option(name, "window-active-style", "fg=default,bg=default")?;
+        self.set_option(name, "pane-border-style", "fg=default,bg=default")?;
+        self.set_option(name, "pane-active-border-style", "fg=default,bg=default")?;
+        self.set_option(name, "pane-border-status", "off")?;
         self.set_option(
             name,
             "status-left",
-            "[DAVID] project: #{@david-project} | worktree: #{@david-worktree} | agent: #{@david-agent}",
+            "#[bg=colour253,fg=colour235] DAVID #[bg=colour251,fg=colour235] project: #{@david-project}  worktree: #{@david-worktree}  agent: #{@david-agent} ",
         )?;
         self.set_option(name, "status-left-length", &status_left_length(metadata))?;
-        self.set_option(name, "status-right", "detach: Ctrl-]")?;
+        self.set_option(
+            name,
+            "status-right",
+            "#[bg=colour251,fg=colour235] detach: Ctrl-] #[bg=colour253,fg=colour235] ",
+        )?;
         self.set_option(name, "status-right-length", "32")
     }
 
@@ -2169,6 +2188,32 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         write_porcelain_list(&entries, zero, output)
     }
 
+    pub fn list_interactive(&self, cwd: &Path) -> Result<()> {
+        let entries = self.managed_worktrees(cwd)?;
+        if entries.is_empty() {
+            println!("No managed worktrees.");
+            return Ok(());
+        }
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} ({}) [{}]",
+                    entry.name,
+                    entry.branch,
+                    entry.session.as_str()
+                )
+            })
+            .collect();
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select a worktree")
+            .items(&labels)
+            .default(0)
+            .interact()
+            .map_err(io::Error::from)?;
+        self.run_with_options(cwd, &entries[selection].name, RunOptions::default())
+    }
+
     pub fn path<W: Write>(&self, cwd: &Path, name: &str, zero: bool, output: &mut W) -> Result<()> {
         validate_worktree_name(name)?;
 
@@ -2613,7 +2658,7 @@ fn session_key_tables(session: &str) -> [String; 2] {
 }
 
 fn status_left_length(metadata: &SessionMetadata) -> String {
-    let length = "[DAVID] project:  | worktree:  | agent: ".chars().count()
+    let length = " DAVID  project:   worktree:   agent:  ".chars().count()
         + metadata.project_name.chars().count()
         + metadata.worktree_name.chars().count()
         + metadata.agent_name.chars().count();
@@ -4664,10 +4709,13 @@ mod tests {
 
             let directory = tempfile::tempdir().unwrap();
             fs::create_dir(directory.path().join("tmux")).unwrap();
+            let socket = format!("d{}", stable_hash(label));
             let wrapper = directory.path().join("tmux-wrapper");
             fs::write(
                 &wrapper,
-                "#!/bin/sh\nunset TMUX\nexport TMUX_TMPDIR=\"$(dirname \"$0\")/tmux\"\nexec tmux \"$@\"\n",
+                format!(
+                    "#!/bin/sh\nunset TMUX\nexport TMUX_TMPDIR=\"$(dirname \"$0\")/tmux\"\nexec tmux -L {socket} \"$@\"\n"
+                ),
             )
             .unwrap();
             let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
@@ -4828,7 +4876,7 @@ mod tests {
         assert_eq!(show_option("@david-worktree"), metadata.worktree_name);
         assert_eq!(show_option("@david-agent"), metadata.agent_name);
         assert!(show_option("status-left").contains("@david-project"));
-        assert_eq!(show_option("status-right"), "detach: Ctrl-]");
+        assert!(show_option("status-right").contains("detach: Ctrl-]"));
 
         let table = second_table;
         assert!(session_key_tables(&session).contains(&table));
@@ -4867,7 +4915,7 @@ mod tests {
         assert!(output.status.success());
         let rendered = text(&output.stdout);
         let expected = format!(
-            "[DAVID] project: {} | worktree: {} | agent: {}|detach: Ctrl-]",
+            "#[bg=colour253,fg=colour235] DAVID #[bg=colour251,fg=colour235] project: {}  worktree: {}  agent: {} |#[bg=colour251,fg=colour235] detach: Ctrl-] #[bg=colour253,fg=colour235]",
             metadata.project_name, metadata.worktree_name, metadata.agent_name
         );
         assert_eq!(rendered.trim(), expected);
