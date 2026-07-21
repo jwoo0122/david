@@ -59,7 +59,7 @@ decisions:
     status: accepted
     scope: worktree
     decision_type: boundary
-    summary: Managed worktrees live under a user-scoped hidden directory and are paired
+    summary: Managed worktrees live under XDG base directories and are paired
       with same-named branches for their full lifecycle.
     applies_to:
       - worktree creation and removal
@@ -69,4 +69,4 @@ decisions:
     depends_on: []
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-16'
+    last_reviewed: '2026-07-22'
