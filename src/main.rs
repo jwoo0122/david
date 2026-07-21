@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use david::{App, DavidPaths, Result, RunOptions, TmuxBackend};
+use david::{App, DavidPaths, Result, RunOptions, TmuxBackend, ToolError};
 use std::{env, io, io::IsTerminal};
 
 #[derive(Debug, Parser)]
@@ -19,8 +19,8 @@ enum Command {
     Setup,
     /// Create or reuse a worktree and attach to its agent session.
     Run {
-        /// Name of the managed worktree.
-        name: String,
+        /// Name of the managed worktree. If omitted in an interactive terminal, a picker is shown.
+        name: Option<String>,
         /// Select a configured agent without opening the picker.
         #[arg(short = 'a', long)]
         agent: Option<String>,
@@ -111,30 +111,34 @@ fn run() -> Result<()> {
                         io::stdin().is_terminal(),
                         io::stderr().is_terminal(),
                     );
-                    app.run_with_options(
-                        &cwd,
-                        &name,
-                        RunOptions {
-                            agent,
-                            agent_args,
-                            interactive,
-                            attach: !detach && interactive,
-                        },
-                    )
+                    let options = RunOptions {
+                        agent,
+                        agent_args,
+                        interactive,
+                        attach: !detach && interactive,
+                    };
+                    match name {
+                        Some(name) => app.run_with_options(&cwd, &name, options),
+                        None => {
+                            if interactive {
+                                app.run_interactive(&cwd, options)
+                            } else {
+                                Err(ToolError::Message(
+                                    "non-interactive run requires a worktree name".to_owned(),
+                                ))
+                            }
+                        }
+                    }
                 }
                 Command::Attach { name } => app.attach(&cwd, &name),
                 Command::Prompt { worktree, message } => app.prompt(&cwd, &worktree, &message),
                 Command::List { porcelain, zero } => {
+                    let stdout = io::stdout();
+                    let is_terminal = stdout.is_terminal();
+                    let mut output = stdout.lock();
                     if porcelain {
-                        let stdout = io::stdout();
-                        let mut output = stdout.lock();
                         app.list_porcelain(&cwd, zero, &mut output)
-                    } else if io::stdin().is_terminal() && io::stderr().is_terminal() {
-                        app.list_interactive(&cwd)
                     } else {
-                        let stdout = io::stdout();
-                        let is_terminal = stdout.is_terminal();
-                        let mut output = stdout.lock();
                         app.list(&cwd, is_terminal, &mut output)
                     }
                 }
@@ -229,7 +233,7 @@ mod tests {
                 no_interactive,
                 agent_args,
             } => {
-                assert_eq!(name, "feature-login");
+                assert_eq!(name.as_deref(), Some("feature-login"));
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert!(detach);
                 assert!(!no_interactive);

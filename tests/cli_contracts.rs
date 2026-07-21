@@ -343,3 +343,21 @@ fn cli_rejects_list_zero_without_porcelain_and_documents_new_options() {
     assert!(path_help.stderr.is_empty());
     assert!(String::from_utf8_lossy(&path_help.stdout).contains("-0"));
 }
+
+#[test]
+fn run_without_name_in_noninteractive_mode_exits_one() {
+    let repo = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    let tmux = fake_tmux();
+
+    let output = david(
+        home.path(),
+        repo.path(),
+        &["run", "--no-interactive"],
+        Some(tmux.path()),
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("non-interactive"));
+    assert!(!home.path().join(".david/worktrees").exists());
+}

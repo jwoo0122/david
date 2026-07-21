@@ -8,7 +8,7 @@ applies_to:
   - tmux session creation and attach
   - prompt delivery to a managed agent session
   - list and remove process state
-  - interactive list selection
+  - interactive worktree selection from run
 summary: Each managed worktree owns at most one persistent tmux agent session that the CLI can attach to or prompt.
 constrains: []
 depends_on:
@@ -36,7 +36,7 @@ During an in-progress rebase, Git may report a managed worktree as detached. Rea
 
 `prompt <worktree> <message>` MUST resolve the same managed worktree and session identity as `run`, require a live session with matching metadata, and deliver the exact received message as literal UTF-8 paste data followed by one `Enter` submission. It MUST NOT create a worktree or session, invoke the agent picker, or attach to tmux. Delivery MUST target the exact managed session and agent pane rather than the caller's current tmux target; prompt data MUST travel through tmux stdin and MUST NOT be interpreted as shell commands or tmux key names.
 
-`list` MAY present an interactive picker (arrow-key navigation + Enter) when stdin and stderr are terminals. Selecting a worktree MUST trigger the same reuse/attach/session-creation flow as `run` for an existing worktree. Non-interactive or piped input, and `--porcelain` output, MUST retain the existing non-interactive table or porcelain output. `list` MUST report only sessions created and tracked by this CLI. Removing a worktree MUST terminate its managed tmux session before removing the checkout.
+`run` without a worktree name MUST present an interactive picker (arrow-key navigation + Enter) when stdin and stderr are terminals and interaction is enabled. The picker MUST list existing managed worktrees with their agent name and session status, and MUST always include a "New worktree..." option. Selecting an existing worktree MUST trigger the same reuse/attach/session-creation flow as `run` with an explicit name. Selecting "New worktree..." MUST prompt for a worktree name, then create the worktree and resolve the agent following the same precedence as an explicit run. `run` without a name in a non-interactive context MUST fail immediately without creating a worktree or session. `list` MUST always present the non-interactive table or porcelain output; it MUST NOT present an interactive picker. `list` MUST report only sessions created and tracked by this CLI. Removing a worktree MUST terminate its managed tmux session before removing the checkout.
 
 A managed session MUST provide a session-scoped `Ctrl-]` shortcut that detaches the client without stopping the agent. The shortcut MUST NOT replace root or prefix bindings for unrelated tmux sessions. The standard `Ctrl-b d` tmux sequence MUST remain available as a fallback. While attached, the tmux status line MUST identify the session as `DAVID` and show the project directory name, worktree name, configured agent name, and the detach shortcut.
 
@@ -71,7 +71,8 @@ A directly exec'd child process is tied to the invoking terminal and cannot prov
 - Removal MUST terminate the session before deleting its worktree.
 - The CLI MUST report a clear prerequisite error when tmux is unavailable.
 - A managed session MUST explicitly set window, pane, and status styling to prevent global tmux option leakage.
-- Interactive list selection MUST reuse the run flow for an existing worktree and MUST NOT create a new worktree.
+- Interactive worktree selection from `run` without a name MUST reuse the run flow for an existing worktree and MUST create a new worktree only through the "New worktree..." prompt.
+- `list` MUST NOT present an interactive picker; it MUST always show the table or porcelain output.
 
 ## Alternatives and trade-offs
 
@@ -85,7 +86,7 @@ Users can detach with the direct `Ctrl-]` shortcut or tmux's standard `Ctrl-b d`
 
 ## Enforcement
 
-Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, deterministic agent precedence, unknown-agent and missing-selection failures, non-terminal and detach behavior, literal runtime argv, explicit attach without creation or restart, prompt delivery without attach or picker interaction, literal Unicode and multiline prompt content, missing/dead session handling, stale-session handling, tmux ownership metadata mismatch, rebase-detached reattachment, arbitrary-detached and wrong-branch rejection, list output, tmux prerequisite failure, removal ordering, serialized lifecycle operations, the managed-session status line and detach binding, and the managed mouse and extended-key options. Integration tests MUST verify that session-scoped window, pane, and status styling options are explicitly set and override global defaults. Integration tests MUST verify interactive list selection triggers run-reuse for the selected worktree and non-interactive list retains table output.
+Integration tests MUST cover session creation, reuse and attach, picker suppression for live sessions, deterministic agent precedence, unknown-agent and missing-selection failures, non-terminal and detach behavior, literal runtime argv, explicit attach without creation or restart, prompt delivery without attach or picker interaction, literal Unicode and multiline prompt content, missing/dead session handling, stale-session handling, tmux ownership metadata mismatch, rebase-detached reattachment, arbitrary-detached and wrong-branch rejection, list output, tmux prerequisite failure, removal ordering, serialized lifecycle operations, the managed-session status line and detach binding, and the managed mouse and extended-key options. Integration tests MUST verify that session-scoped window, pane, and status styling options are explicitly set and override global defaults. Integration tests MUST verify non-interactive `run` without a name fails without creating a worktree. Integration tests MUST verify `list` always retains table output.
 
 ## Revisit when
 

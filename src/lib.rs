@@ -2188,22 +2188,25 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         write_porcelain_list(&entries, zero, output)
     }
 
-    pub fn list_interactive(&self, cwd: &Path) -> Result<()> {
-        let entries = self.managed_worktrees(cwd)?;
+    pub fn run_interactive(&self, cwd: &Path, options: RunOptions) -> Result<()> {
+        let mut entries = self.managed_worktrees(cwd)?;
+        entries.sort_by_key(|e| matches!(e.session, SessionStatus::Inactive));
         if entries.is_empty() {
-            println!("No managed worktrees.");
-            return Ok(());
+            let name = prompt_text("Worktree name", false)?;
+            return self.run_with_options(cwd, &name, options);
         }
         let labels: Vec<String> = entries
             .iter()
             .map(|entry| {
                 format!(
-                    "{} ({}) [{}]",
+                    "{} ({}) [{} · {}]",
                     entry.name,
                     entry.branch,
+                    entry.agent,
                     entry.session.as_str()
                 )
             })
+            .chain(std::iter::once("New worktree...".to_owned()))
             .collect();
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Select a worktree")
@@ -2211,7 +2214,12 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             .default(0)
             .interact()
             .map_err(io::Error::from)?;
-        self.run_with_options(cwd, &entries[selection].name, RunOptions::default())
+        if selection < entries.len() {
+            self.run_with_options(cwd, &entries[selection].name, options)
+        } else {
+            let name = prompt_text("Worktree name", false)?;
+            self.run_with_options(cwd, &name, options)
+        }
     }
 
     pub fn path<W: Write>(&self, cwd: &Path, name: &str, zero: bool, output: &mut W) -> Result<()> {
