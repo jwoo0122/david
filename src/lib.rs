@@ -1006,6 +1006,43 @@ impl TmuxBackend {
         self.run_command(command)
     }
 
+    /// Ensures tmux knows the outer terminal supports extended keys.
+    ///
+    /// Detects the outer terminal from the `TERM` environment variable
+    /// (which reflects the user's terminal, not tmux's `tmux-256color`).
+    /// If the terminal is known to support extended keys, appends an
+    /// `extkeys` entry to the server's `terminal-features` so tmux
+    /// enables modifyOtherKeys on the outer terminal. Also sets
+    /// `extended-keys-format` to `csi-u` so extended key sequences are
+    /// reported in CSI u format, which crossterm and other TUI libraries
+    /// can parse when kitty keyboard protocol enhancement flags are pushed.
+    fn ensure_extended_key_features(&self) -> Result<()> {
+        let term = env::var("TERM").unwrap_or_default();
+        let Some(entry) = extended_key_terminal_feature(&term) else {
+            return Ok(());
+        };
+
+        // Check if the entry is already present to avoid duplicates.
+        let mut show = self.command();
+        show.args(["show-options", "-s", "-v", "terminal-features"]);
+        let output = self.output(show)?;
+        if text(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == entry)
+        {
+            // Entry already present; still ensure format is csi-u.
+        } else {
+            let mut command = self.command();
+            command.args(["set-option", "-s", "-a", "terminal-features", entry]);
+            self.run_command(command)?;
+        }
+
+        // Use CSI u format so applications that push kitty keyboard
+        // enhancement flags (which tmux ignores) still receive
+        // parseable extended key sequences.
+        self.set_server_option("extended-keys-format", "csi-u")
+    }
+
     fn show_option_at(&self, target: &str, option: &str) -> Result<String> {
         let mut command = self.command();
         command
@@ -1470,7 +1507,8 @@ impl SessionBackend for TmuxBackend {
         let target = self.session_id(name)?;
         self.validate_session_metadata_at(name, &target, metadata)?;
         self.set_option_at(&target, "mouse", "on")?;
-        self.set_server_option("extended-keys", "on")
+        self.set_server_option("extended-keys", "on")?;
+        self.ensure_extended_key_features()
     }
 
     fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
@@ -2872,6 +2910,26 @@ fn supports_extended_keys(version: &str) -> bool {
         return false;
     };
     major > 3 || major == 3 && minor >= 2
+}
+
+
+/// Returns a `terminal-features` entry that adds the `extkeys` feature
+/// for the given terminal type, if the terminal is known to support
+/// extended keys (modifyOtherKeys).
+///
+/// tmux auto-detects extended key support for only a few terminals.
+/// For others like Ghostty, the `extkeys` feature must be set explicitly
+/// so tmux enables modifyOtherKeys on the outer terminal.
+fn extended_key_terminal_feature(term: &str) -> Option<&'static str> {
+    if term.starts_with("xterm-ghostty") || term.starts_with("ghostty") {
+        Some("xterm-ghostty:extkeys")
+    } else if term.starts_with("xterm-kitty") {
+        Some("xterm-kitty:extkeys")
+    } else if term.starts_with("wezterm") {
+        Some("wezterm:extkeys")
+    } else {
+        None
+    }
 }
 
 fn tmux_server_is_absent(detail: &str) -> bool {
@@ -5606,6 +5664,25 @@ mod tests {
             "error connecting to /tmp/tmux/default (No such file or directory)"
         ));
         assert!(!tmux_server_is_absent("protocol version mismatch"));
+    }
+
+    #[test]
+    fn extended_key_terminal_feature_for_known_terminals() {
+        assert_eq!(
+            extended_key_terminal_feature("xterm-ghostty"),
+            Some("xterm-ghostty:extkeys")
+        );
+        assert_eq!(
+            extended_key_terminal_feature("xterm-kitty"),
+            Some("xterm-kitty:extkeys")
+        );
+        assert_eq!(
+            extended_key_terminal_feature("wezterm"),
+            Some("wezterm:extkeys")
+        );
+        assert_eq!(extended_key_terminal_feature("tmux-256color"), None);
+        assert_eq!(extended_key_terminal_feature("xterm-256color"), None);
+        assert_eq!(extended_key_terminal_feature(""), None);
     }
 
     #[cfg(unix)]
