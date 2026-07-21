@@ -2078,22 +2078,88 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             })
     }
 
-    pub fn list<W: Write>(&self, cwd: &Path, output: &mut W) -> Result<()> {
-        let entries = self.managed_worktrees(cwd)?;
+    pub fn list<W: Write>(
+        &self,
+        cwd: &Path,
+        colored: bool,
+        output: &mut W,
+    ) -> Result<()> {
+        let mut entries = self.managed_worktrees(cwd)?;
+        entries.sort_by_key(|e| matches!(e.session, SessionStatus::Inactive));
 
-        writeln!(output, "NAME\tBRANCH\tAGENT\tPATH")?;
+        if entries.is_empty() {
+            writeln!(output, "No managed worktrees.")?;
+            return Ok(());
+        }
+
+        let name_w = entries
+            .iter()
+            .map(|e| e.name.len())
+            .chain(std::iter::once("NAME".len()))
+            .max()
+            .unwrap();
+        let branch_w = entries
+            .iter()
+            .map(|e| e.branch.len())
+            .chain(std::iter::once("BRANCH".len()))
+            .max()
+            .unwrap();
+        let agent_w = entries
+            .iter()
+            .map(|e| e.agent.len())
+            .chain(std::iter::once("AGENT".len()))
+            .max()
+            .unwrap();
+        let status_w = entries
+            .iter()
+            .map(|e| e.session.as_str().len())
+            .chain(std::iter::once("STATUS".len()))
+            .max()
+            .unwrap();
+
+        let bold = if colored { "\x1b[1m" } else { "" };
+        let reset = if colored { "\x1b[0m" } else { "" };
+
+        writeln!(
+            output,
+            "{}{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}  PATH{}",
+            bold,
+            "NAME",
+            "BRANCH",
+            "AGENT",
+            "STATUS",
+            reset,
+            nw = name_w,
+            bw = branch_w,
+            aw = agent_w,
+            sw = status_w,
+        )?;
+
         for entry in &entries {
+            let color = if colored {
+                match entry.session {
+                    SessionStatus::Active => "\x1b[32m",
+                    SessionStatus::Unknown => "\x1b[33m",
+                    SessionStatus::Inactive => "\x1b[90m",
+                }
+            } else {
+                ""
+            };
             writeln!(
                 output,
-                "{}\t{}\t{}\t{}",
+                "{}{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}  {}{}",
+                color,
                 entry.name,
                 entry.branch,
                 entry.agent,
-                entry.path.display()
+                entry.session.as_str(),
+                entry.path.display(),
+                reset,
+                nw = name_w,
+                bw = branch_w,
+                aw = agent_w,
+                sw = status_w,
             )?;
-        }
-        if entries.is_empty() {
-            writeln!(output, "No managed worktrees.")?;
         }
         Ok(())
     }
@@ -3048,6 +3114,22 @@ mod tests {
         App::with_picker(paths, sessions, FirstAgentPicker)
     }
 
+    /// Build the space-padded prefix of a human-list row (everything before the PATH column).
+    fn row_prefix(name: &str, branch: &str, agent: &str, status: &str) -> String {
+        let nw = name.len().max("NAME".len());
+        let bw = branch.len().max("BRANCH".len());
+        let aw = agent.len().max("AGENT".len());
+        let sw = status.len().max("STATUS".len());
+        format!(
+            "{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}",
+            name, branch, agent, status,
+            nw = nw,
+            bw = bw,
+            aw = aw,
+            sw = sw,
+        )
+    }
+
     struct ScriptedSetup {
         additions: Vec<(String, Agent)>,
     }
@@ -3697,7 +3779,7 @@ mod tests {
 
         assert!(app.attach(repo.path(), "feature").is_err());
         assert!(app.prompt(repo.path(), "feature", "message").is_err());
-        assert!(app.list(repo.path(), &mut Vec::new()).is_err());
+        assert!(app.list(repo.path(), false, &mut Vec::new()).is_err());
         assert!(app.remove(repo.path(), "feature", true).is_err());
         assert!(sessions.state.borrow().live.contains(&session));
     }
@@ -4097,11 +4179,11 @@ mod tests {
         assert_eq!(sessions.state.borrow().attached.len(), 2);
 
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("feature/login\tfeature/login\ttest\t")
+                .contains(&row_prefix("feature/login", "feature/login", "test", "active"))
         );
 
         app.remove(repo.path(), name, true).unwrap();
@@ -4461,9 +4543,9 @@ mod tests {
         app.run(repo.path(), "feature").unwrap();
 
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("feature\tfeature\ttest\t"));
+        assert!(output.contains(&row_prefix("feature", "feature", "test", "active")));
     }
 
     #[test]
@@ -4480,9 +4562,9 @@ mod tests {
         );
         let target = fs::canonicalize(target).unwrap();
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         let expected = format!(
-            "NAME\tBRANCH\tAGENT\tPATH\nfeature\tfeature\ttest\t{}\n",
+            "NAME     BRANCH   AGENT  STATUS  PATH\nfeature  feature  test   active  {}\n",
             target.display()
         );
         assert_eq!(output, expected.as_bytes());
@@ -4817,11 +4899,11 @@ mod tests {
         sessions.state.borrow_mut().pane_dead = true;
 
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
 
-        assert!(output.contains("feature\tfeature\t-\t"));
-        assert!(!output.contains("feature\tfeature\ttest\t"));
+        assert!(output.contains(&row_prefix("feature", "feature", "-", "inactive")));
+        assert!(!output.contains("test"));
 
         let mut porcelain = Vec::new();
         app.list_porcelain(repo.path(), false, &mut porcelain)
@@ -4889,29 +4971,29 @@ mod tests {
         run_git(&target, &["checkout", "--detach", "HEAD"]);
 
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("feature\t(detached)\t-\t")
+                .contains(&row_prefix("feature", "(detached)", "-", "inactive"))
         );
 
         run_git(&target, &["switch", "-c", "other"]);
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("feature\tother\t-\t")
+                .contains(&row_prefix("feature", "other", "-", "inactive"))
         );
 
         fs::remove_dir_all(&target).unwrap();
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("feature\tother\t-\t")
+                .contains(&row_prefix("feature", "other", "-", "inactive"))
         );
     }
 
@@ -4936,12 +5018,12 @@ mod tests {
         fs::write(state_path, legacy).unwrap();
 
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
 
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains("feature\tfeature\t-\t")
+                .contains(&row_prefix("feature", "feature", "-", "inactive"))
         );
     }
 
@@ -5083,10 +5165,10 @@ mod tests {
         symlink(&moved, &target).unwrap();
 
         let mut output = Vec::new();
-        app.list(repo.path(), &mut output).unwrap();
+        app.list(repo.path(), false, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
 
-        assert!(!output.contains("feature\tfeature\t"));
+        assert!(!output.contains("feature"));
         assert!(output.contains("No managed worktrees."));
     }
 

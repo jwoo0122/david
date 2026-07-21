@@ -142,7 +142,7 @@ fn list_human_bytes_and_empty_porcelain_output_are_stable() {
     assert!(human.stderr.is_empty());
     assert_eq!(
         human.stdout,
-        b"NAME\tBRANCH\tAGENT\tPATH\nNo managed worktrees.\n"
+        b"No managed worktrees.\n"
     );
 
     let porcelain = david(
