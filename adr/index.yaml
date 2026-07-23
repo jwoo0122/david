@@ -39,9 +39,7 @@ decisions:
     scope: runtime
     decision_type: integration
     summary: Each managed worktree owns at most one persistent tmux agent session
-      that the CLI can attach to or prompt; sessions explicitly set window, pane,
-      and status styling to prevent global tmux option leakage, and run without a name offers
-      interactive worktree selection.
+      that the CLI can attach to or prompt.
     applies_to:
       - configured agent launch
       - tmux session creation and attach
@@ -54,13 +52,13 @@ decisions:
       - worktree.storage-and-lifecycle
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-22'
+    last_reviewed: '2026-07-21'
   - id: worktree.storage-and-lifecycle
     status: accepted
     scope: worktree
     decision_type: boundary
-    summary: Managed worktrees live under XDG base directories and are paired
-      with same-named branches for their full lifecycle.
+    summary: Managed worktrees live under XDG base directories and are paired with
+      same-named branches for their full lifecycle.
     applies_to:
       - worktree creation and removal
       - run and list commands

@@ -25,7 +25,7 @@ How does a first-time or returning user create and update the configured agent l
 
 `david setup` MUST work without a Git repository or a live tmux session. It MUST prompt for an agent name, command, and one-line argument string using the CLI's interactive prompt dependency. The argument string MUST be parsed into direct-execution arguments with shell-style quote removal; the agent command MUST NOT be executed while configuring it.
 
-The command MUST load an existing `~/.david/config.toml` when present, preserve agents not mentioned in the current setup session, and replace an existing agent when the entered name matches it. After each completed agent entry it MUST show the complete resulting agent list. An empty agent name MUST finish the loop. The command MUST reject finishing when no agent is configured, then MUST create the user-scoped directory structure and write the configuration.
+The command MUST load the resolved David configuration when present, using the XDG configuration path and fallback defined by `worktree.storage-and-lifecycle`. It MUST preserve agents not mentioned in the current setup session and replace an existing agent when the entered name matches it. After each completed agent entry it MUST show the complete resulting agent list. An empty agent name MUST finish the loop. The command MUST reject finishing when no agent is configured, then MUST create the user-scoped directory structure and write the configuration.
 
 ## Context and forces
 
@@ -38,7 +38,7 @@ Manually creating a hidden directory and TOML file is unnecessary first-run fric
 - Existing configured agents MUST remain unless their names are explicitly re-entered.
 - The agent name, command, and parsed arguments MUST be written to the existing TOML schema. An optional `default_agent` value MUST be preserved when setup merges and rewrites configuration, and runtime loading MUST reject it when it does not name a configured agent.
 - A setup session with no configured agents MUST fail without writing an unusable configuration.
-- The resulting configuration MUST be stored at `~/.david/config.toml` and the managed state directories MUST be scaffolded.
+- The resulting configuration MUST be stored at the resolved XDG configuration path and the managed state directories MUST be scaffolded.
 
 ## Alternatives and trade-offs
 
