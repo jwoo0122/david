@@ -62,7 +62,72 @@ pub struct DavidPaths {
 impl DavidPaths {
     pub fn from_home(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
+        Self {
+            worktrees: home
+                .join(".local")
+                .join("share")
+                .join("david")
+                .join("worktrees"),
+            sessions: home
+                .join(".local")
+                .join("state")
+                .join("david")
+                .join("sessions"),
+            config: home.join(".config").join("david").join("config.toml"),
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let xdg = Self::xdg_paths()?;
+        if !xdg.has_data()
+            && let Some(root) = Self::legacy_root()?
+        {
+            Self::emit_legacy_warning(&xdg);
+            return Ok(Self::legacy_paths(&root));
+        }
+        Ok(xdg)
+    }
+
+    fn has_data(&self) -> bool {
+        self.config.is_file() || dir_has_files(&self.worktrees) || dir_has_files(&self.sessions)
+    }
+
+    fn resolve_xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {
+        match env::var_os(var) {
+            Some(value) if Path::new(&value).is_absolute() => Ok(PathBuf::from(value)),
+            _ => {
+                let home = env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| ToolError::Message("HOME is not set".to_owned()))?;
+                Ok(home.join(fallback))
+            }
+        }
+    }
+
+    fn xdg_paths() -> Result<Self> {
+        let config_root = Self::resolve_xdg_dir("XDG_CONFIG_HOME", ".config")?.join("david");
+        let worktrees = Self::resolve_xdg_dir("XDG_DATA_HOME", ".local/share")?
+            .join("david")
+            .join("worktrees");
+        let sessions = Self::resolve_xdg_dir("XDG_STATE_HOME", ".local/state")?
+            .join("david")
+            .join("sessions");
+        Ok(Self {
+            worktrees,
+            sessions,
+            config: config_root.join("config.toml"),
+        })
+    }
+
+    fn legacy_root() -> Result<Option<PathBuf>> {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| ToolError::Message("HOME is not set".to_owned()))?;
         let root = home.join(".david");
+        Ok(if root.exists() { Some(root) } else { None })
+    }
+
+    fn legacy_paths(root: &Path) -> Self {
         Self {
             worktrees: root.join("worktrees"),
             sessions: root.join("sessions"),
@@ -70,11 +135,162 @@ impl DavidPaths {
         }
     }
 
-    pub fn from_env() -> Result<Self> {
+    fn emit_legacy_warning(xdg: &Self) {
+        eprintln!("warning: using legacy ~/.david storage. New XDG locations:");
+        eprintln!("  config:   {}", xdg.config.display());
+        eprintln!("  worktrees: {}", xdg.worktrees.display());
+        eprintln!("  sessions: {}", xdg.sessions.display());
+        eprintln!("Run 'david migrate' to move your data to the new locations.");
+    }
+
+    pub fn migrate(&self, git: &Git, dry_run: bool) -> Result<()> {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| ToolError::Message("HOME is not set".to_owned()))?;
-        Ok(Self::from_home(home))
+        let legacy_root = home.join(".david");
+        if !legacy_root.exists() {
+            eprintln!("No legacy ~/.david directory found; nothing to migrate.");
+            return Ok(());
+        }
+
+        let xdg = Self::xdg_paths()?;
+
+        struct MigrationItem {
+            name: &'static str,
+            src: PathBuf,
+            dst: PathBuf,
+            is_worktrees: bool,
+        }
+
+        let items = [
+            MigrationItem {
+                name: "config",
+                src: legacy_root.join("config.toml"),
+                dst: xdg.config.clone(),
+                is_worktrees: false,
+            },
+            MigrationItem {
+                name: "worktrees",
+                src: legacy_root.join("worktrees"),
+                dst: xdg.worktrees.clone(),
+                is_worktrees: true,
+            },
+            MigrationItem {
+                name: "sessions",
+                src: legacy_root.join("sessions"),
+                dst: xdg.sessions.clone(),
+                is_worktrees: false,
+            },
+        ];
+
+        let pending: Vec<&MigrationItem> = items
+            .iter()
+            .filter(|item| item.src.exists())
+            .collect();
+
+        if pending.is_empty() {
+            eprintln!("No legacy David data found in ~/.david; nothing to migrate.");
+            if dir_is_empty(&legacy_root) {
+                eprintln!(
+                    "Removing empty legacy directory: {}",
+                    legacy_root.display()
+                );
+                if !dry_run {
+                    fs::remove_dir(&legacy_root)?;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut conflicts = Vec::new();
+        for item in &pending {
+            if item.dst.is_file() || (item.dst.is_dir() && !dir_is_empty(&item.dst)) {
+                conflicts.push(format!(
+                    "{}: destination already exists at {}",
+                    item.name,
+                    item.dst.display()
+                ));
+            }
+        }
+        if !conflicts.is_empty() {
+            eprintln!("Migration conflicts detected:");
+            for conflict in &conflicts {
+                eprintln!("  {conflict}");
+            }
+            return Err(ToolError::Message(
+                "destination conflicts prevent migration; resolve them and retry".to_owned(),
+            ));
+        }
+
+        eprintln!("Migration plan:");
+        for item in &pending {
+            eprintln!(
+                "  {}: {} -> {}",
+                item.name,
+                item.src.display(),
+                item.dst.display()
+            );
+        }
+        if dry_run {
+            eprintln!("(dry-run: no changes made)");
+            return Ok(());
+        }
+
+        for item in &pending {
+            eprintln!("Migrating {}...", item.name);
+            if item.dst.is_dir() && dir_is_empty(&item.dst) {
+                fs::remove_dir(&item.dst)?;
+            }
+            if item.is_worktrees {
+                migrate_worktrees(git, &item.src, &item.dst)?;
+            } else if item.src.is_dir() {
+                if let Some(parent) = item.dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let temp = item
+                    .dst
+                    .parent()
+                    .unwrap_or(&item.dst)
+                    .join(format!(".david-migrate-tmp-{}", item.name));
+                if temp.exists() {
+                    fs::remove_dir_all(&temp)?;
+                }
+                copy_dir_recursive(&item.src, &temp)?;
+                fs::rename(&temp, &item.dst)?;
+                fs::remove_dir_all(&item.src)?;
+            } else {
+                if let Some(parent) = item.dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let temp = item
+                    .dst
+                    .parent()
+                    .unwrap_or(&item.dst)
+                    .join(format!(".david-migrate-tmp-{}", item.name));
+                if temp.exists() {
+                    fs::remove_file(&temp)?;
+                }
+                fs::copy(&item.src, &temp)?;
+                fs::rename(&temp, &item.dst)?;
+                fs::remove_file(&item.src)?;
+            }
+            eprintln!("  Done: {}", item.dst.display());
+        }
+
+        if dir_is_empty(&legacy_root) {
+            eprintln!(
+                "Removing empty legacy directory: {}",
+                legacy_root.display()
+            );
+            fs::remove_dir(&legacy_root)?;
+        } else {
+            eprintln!(
+                "Legacy directory {} is not empty; preserving remaining files.",
+                legacy_root.display()
+            );
+        }
+        eprintln!("Migration complete.");
+        Ok(())
     }
 
     pub fn config_path(&self) -> &Path {
@@ -665,6 +881,24 @@ impl Git {
 
     fn worktree_is_dirty(&self, worktree: &Path) -> Result<bool> {
         self.source_is_dirty(worktree)
+    }
+
+    fn move_worktree(&self, worktree_path: &Path, new_path: &Path) -> Result<()> {
+        let common_dir = self.common_git_dir(worktree_path)?;
+        let repo_root = if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            common_dir
+                .parent()
+                .unwrap_or(&common_dir)
+                .to_path_buf()
+        } else {
+            common_dir.clone()
+        };
+        let mut command = self.command(&repo_root);
+        command
+            .args(["worktree", "move"])
+            .arg(worktree_path)
+            .arg(new_path);
+        self.output(command).map(|_| ())
     }
 }
 
@@ -2640,6 +2874,70 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
     }
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = fs::read_link(&src_path)?;
+                std::os::unix::fs::symlink(&target, &dst_path)?;
+            }
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn dir_is_empty(path: &Path) -> bool {
+    path.read_dir()
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true)
+}
+
+fn dir_has_files(path: &Path) -> bool {
+    !dir_is_empty(path)
+}
+
+fn migrate_worktrees(git: &Git, src: &Path, dst: &Path) -> Result<()> {
+    for repo_entry in fs::read_dir(src)? {
+        let repo_entry = repo_entry?;
+        let repo_id = repo_entry.file_name();
+        let repo_dir = repo_entry.path();
+        if !repo_dir.is_dir() {
+            continue;
+        }
+        let dst_repo_dir = dst.join(&repo_id);
+        for wt_entry in fs::read_dir(&repo_dir)? {
+            let wt_entry = wt_entry?;
+            let wt_name = wt_entry.file_name();
+            let old_path = wt_entry.path();
+            if !old_path.is_dir() {
+                continue;
+            }
+            let new_path = dst_repo_dir.join(&wt_name);
+            if let Some(parent) = new_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            eprintln!(
+                "  worktree: {} -> {}",
+                old_path.display(),
+                new_path.display()
+            );
+            git.move_worktree(&old_path, &new_path)?;
+        }
+    }
+    fs::remove_dir_all(src)?;
+    Ok(())
+}
+
 pub fn validate_worktree_name(name: &str) -> Result<()> {
     if name.trim().is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err(ToolError::Message(
@@ -3503,10 +3801,10 @@ mod tests {
     }
 
     #[test]
-    fn uses_david_storage_namespace() {
+    fn uses_xdg_storage_paths() {
         let home = tempfile::tempdir().unwrap();
         let paths = DavidPaths::from_home(home.path());
-        let expected = home.path().join(".david/config.toml");
+        let expected = home.path().join(".config/david/config.toml");
 
         assert_eq!(paths.config_path(), expected.as_path());
     }

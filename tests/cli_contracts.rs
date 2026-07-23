@@ -12,7 +12,13 @@ use tempfile::TempDir;
 
 fn david(home: &Path, cwd: &Path, args: &[&str], fake_tmux: Option<&Path>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_david"));
-    command.current_dir(cwd).env("HOME", home).args(args);
+    command
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
+        .args(args);
     if let Some(fake_tmux) = fake_tmux {
         let original = env::var_os("PATH").unwrap_or_default();
         let path = env::join_paths(
@@ -172,7 +178,9 @@ fn path_outputs_lf_or_nul_and_rejects_missing_worktrees() {
     let home = tempfile::tempdir().unwrap();
     let target = home
         .path()
-        .join(".david")
+        .join(".local")
+        .join("share")
+        .join("david")
         .join("worktrees")
         .join(repository_id(repo.path()))
         .join("feature");
@@ -210,7 +218,9 @@ fn porcelain_nul_output_preserves_a_newline_in_a_worktree_path() {
     let tmux = fake_tmux();
     let target = home
         .path()
-        .join(".david")
+        .join(".local")
+        .join("share")
+        .join("david")
         .join("worktrees")
         .join(repository_id(repo.path()))
         .join("feature\nwith-newline");
@@ -251,7 +261,7 @@ fn porcelain_nul_output_preserves_a_newline_in_a_worktree_path() {
 fn invalid_agent_argument_exits_with_a_controlled_configuration_error() {
     let repo = init_repo();
     let home = tempfile::tempdir().unwrap();
-    let config_dir = home.path().join(".david");
+    let config_dir = home.path().join(".config").join("david");
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
@@ -285,7 +295,9 @@ fn actual_git_worktree_invalid_path_bytes_are_preserved_by_list_and_path() {
         .join(OsString::from_vec(b"home-\xff".to_vec()));
     fs::create_dir(&home).unwrap();
     let target = home
-        .join(".david")
+        .join(".local")
+        .join("share")
+        .join("david")
         .join("worktrees")
         .join(repository_id(repo.path()))
         .join("feature");
@@ -359,5 +371,235 @@ fn run_without_name_in_noninteractive_mode_exits_one() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("non-interactive"));
-    assert!(!home.path().join(".david/worktrees").exists());
+    assert!(!home.path().join(".local/share/david/worktrees").exists());
+}
+
+#[test]
+fn migrate_moves_config_and_sessions_to_xdg_locations() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".david");
+    fs::create_dir_all(legacy.join("sessions")).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+    fs::write(legacy.join("sessions").join("test.state"), "repo_id=test\n").unwrap();
+
+    let output = david(home.path(), home.path(), &["migrate"], None);
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+
+    let xdg_config = home.path().join(".config/david/config.toml");
+    let xdg_sessions = home.path().join(".local/state/david/sessions/test.state");
+    assert!(xdg_config.is_file(), "config not migrated");
+    assert!(xdg_sessions.is_file(), "sessions not migrated");
+    assert!(!legacy.exists(), "legacy dir should be removed");
+}
+
+#[test]
+fn migrate_moves_worktrees_using_git_worktree_move() {
+    let repo = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".david");
+    let repo_id = repository_id(repo.path());
+    let target = legacy.join("worktrees").join(&repo_id).join("feature");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    add_worktree(repo.path(), &target, "feature");
+
+    let output = david(home.path(), repo.path(), &["migrate"], None);
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+
+    let new_target = home
+        .path()
+        .join(".local/share/david/worktrees")
+        .join(&repo_id)
+        .join("feature");
+    assert!(new_target.is_dir(), "worktree not migrated to XDG");
+
+    let list = Command::new("git")
+        .current_dir(repo.path())
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("git worktree list");
+    let list_text = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list_text.contains(&new_target.to_string_lossy().to_string()),
+        "git worktree list should show new location"
+    );
+    assert!(!legacy.exists(), "legacy dir should be removed");
+}
+
+#[test]
+fn migrate_dry_run_makes_no_changes() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".david");
+    fs::create_dir_all(legacy.join("sessions")).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+
+    let output = david(home.path(), home.path(), &["migrate", "--dry-run"], None);
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(legacy.join("config.toml").is_file(), "source should be untouched");
+    assert!(
+        !home.path().join(".config/david/config.toml").is_file(),
+        "destination should not be created"
+    );
+}
+
+#[test]
+fn migrate_detects_destination_conflicts() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".david");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+    let xdg_config = home.path().join(".config/david");
+    fs::create_dir_all(&xdg_config).unwrap();
+    fs::write(
+        xdg_config.join("config.toml"),
+        "[agents.other]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+
+    let output = david(home.path(), home.path(), &["migrate"], None);
+    assert_eq!(output.status.code(), Some(1), "stderr: {:?}", output.stderr);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("conflict"),
+        "should report conflict"
+    );
+    assert!(legacy.join("config.toml").is_file(), "source should be untouched");
+}
+
+#[test]
+fn migrate_is_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".david");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+
+    let first = david(home.path(), home.path(), &["migrate"], None);
+    assert_eq!(first.status.code(), Some(0), "stderr: {:?}", first.stderr);
+
+    let second = david(home.path(), home.path(), &["migrate"], None);
+    assert_eq!(second.status.code(), Some(0), "stderr: {:?}", second.stderr);
+    assert!(home.path().join(".config/david/config.toml").is_file());
+}
+
+#[test]
+fn migrate_preserves_unknown_files_in_legacy_root() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".david");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+    fs::write(legacy.join("unknown.txt"), "preserve me\n").unwrap();
+
+    let output = david(home.path(), home.path(), &["migrate"], None);
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(legacy.exists(), "legacy dir should be preserved");
+    assert!(legacy.join("unknown.txt").is_file(), "unknown file should be preserved");
+    assert!(home.path().join(".config/david/config.toml").is_file());
+}
+
+#[test]
+fn legacy_warning_does_not_contaminate_porcelain_stdout() {
+    let repo = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    let tmux = fake_tmux();
+    let legacy = home.path().join(".david");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+
+    let porcelain = david(
+        home.path(),
+        repo.path(),
+        &["list", "--porcelain"],
+        Some(tmux.path()),
+    );
+    assert_eq!(porcelain.status.code(), Some(0));
+    assert!(porcelain.stdout.is_empty(), "stdout must be clean");
+    assert!(
+        String::from_utf8_lossy(&porcelain.stderr).contains("legacy"),
+        "stderr should contain legacy warning"
+    );
+}
+
+#[test]
+fn migrate_resumes_after_partial_success() {
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".david");
+
+    // Create legacy config only (no sessions, no worktrees)
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+
+    // First migration: config migrates, legacy dir removed
+    let first = david(home.path(), home.path(), &["migrate"], None);
+    assert_eq!(first.status.code(), Some(0), "stderr: {:?}", first.stderr);
+    assert!(home.path().join(".config/david/config.toml").is_file());
+    assert!(!legacy.exists());
+
+    // Simulate partial failure: re-create legacy sessions (as if a later
+    // run created new session data in the old location)
+    fs::create_dir_all(legacy.join("sessions")).unwrap();
+    fs::write(legacy.join("sessions").join("test.state"), "repo_id=test\n").unwrap();
+
+    // Second migration: only sessions should migrate
+    let second = david(home.path(), home.path(), &["migrate"], None);
+    assert_eq!(second.status.code(), Some(0), "stderr: {:?}", second.stderr);
+    assert!(home.path().join(".local/state/david/sessions/test.state").is_file());
+    assert!(!legacy.exists(), "legacy should be cleaned up");
+}
+
+#[test]
+fn migrate_with_custom_xdg_roots() {
+    let home = tempfile::tempdir().unwrap();
+    let xdg_config = tempfile::tempdir().unwrap();
+    let xdg_data = tempfile::tempdir().unwrap();
+    let xdg_state = tempfile::tempdir().unwrap();
+
+    let legacy = home.path().join(".david");
+    fs::create_dir_all(legacy.join("sessions")).unwrap();
+    fs::write(
+        legacy.join("config.toml"),
+        "[agents.test]\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+    fs::write(legacy.join("sessions").join("test.state"), "repo_id=test\n").unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_david"));
+    command
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", xdg_config.path())
+        .env("XDG_DATA_HOME", xdg_data.path())
+        .env("XDG_STATE_HOME", xdg_state.path())
+        .args(["migrate"]);
+    let output = command.output().expect("david migrate");
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+
+    assert!(xdg_config.path().join("david/config.toml").is_file());
+    assert!(xdg_state.path().join("david/sessions/test.state").is_file());
+    assert!(!legacy.exists());
 }

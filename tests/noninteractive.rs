@@ -111,6 +111,9 @@ fn run_david_with_agent(
     command
         .current_dir(repo)
         .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
         .args(args)
         .stdin(Stdio::null());
     server.configure(&mut command);
@@ -127,13 +130,13 @@ fn run_david(server: &TmuxTestServer, home: &Path, repo: &Path, args: &[&str]) -
 }
 
 fn write_config(home: &Path, content: &str) {
-    let directory = home.join(".david");
+    let directory = home.join(".config").join("david");
     fs::create_dir_all(&directory).unwrap();
     fs::write(directory.join("config.toml"), content).unwrap();
 }
 
 fn managed_feature(home: &Path) -> PathBuf {
-    let repositories = fs::read_dir(home.join(".david/worktrees"))
+    let repositories = fs::read_dir(home.join(".local/share/david/worktrees"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
@@ -163,7 +166,7 @@ fn noninteractive_missing_selection_exits_two_without_waiting_or_creating() {
 
         assert_eq!(output.status.code(), Some(2), "stderr: {:?}", output.stderr);
         assert!(String::from_utf8_lossy(&output.stderr).contains("non-interactive"));
-        assert!(!home.path().join(".david/worktrees").exists());
+        assert!(!home.path().join(".local/share/david/worktrees").exists());
     }
 }
 

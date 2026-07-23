@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use david::{App, DavidPaths, Result, RunOptions, TmuxBackend, ToolError};
+use david::{App, DavidPaths, Git, Result, RunOptions, TmuxBackend, ToolError};
 use std::{env, io, io::IsTerminal};
 
 #[derive(Debug, Parser)]
@@ -17,6 +17,12 @@ struct Cli {
 enum Command {
     /// Create or update the user-scoped agent configuration.
     Setup,
+    /// Migrate legacy ~/.david storage to XDG base directories.
+    Migrate {
+        /// Report planned moves and conflicts without making changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Create or reuse a worktree and attach to its agent session.
     Run {
         /// Name of the managed worktree. If omitted in an interactive terminal, a picker is shown.
@@ -95,6 +101,10 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Setup => paths.setup(),
+        Command::Migrate { dry_run } => {
+            let git = Git::default();
+            paths.migrate(&git, dry_run)
+        }
         command => {
             let cwd = env::current_dir()?;
             let app = App::new(paths, TmuxBackend::default());
@@ -149,6 +159,7 @@ fn run() -> Result<()> {
                 }
                 Command::Remove { name, force } => app.remove(&cwd, &name, force),
                 Command::Setup => unreachable!(),
+                Command::Migrate { .. } => unreachable!(),
             }
         }
     }
