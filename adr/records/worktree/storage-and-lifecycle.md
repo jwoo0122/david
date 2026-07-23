@@ -38,7 +38,7 @@ The repository identity MUST include a stable identifier derived from the canoni
 
 Sibling directories make managed checkouts visible beside every project and can create naming collisions or clutter. A user-scoped directory centralizes lifecycle management while retaining separate checkouts for each repository.
 
-The XDG Base Directory specification separates configuration, data, and state per their distinct lifecycles and ownership. A single hidden root mixes them, making backup, cleanup, and compliance with platform conventions harder. The hard rebrand from `~/.tony` to `~/.david` motivated a single root initially, but XDG compliance is now preferred.
+The XDG Base Directory specification separates configuration, data, and state per their distinct lifecycles and ownership. A single hidden root mixes them, making backup, cleanup, and compliance with platform conventions harder. XDG locations are therefore preferred.
 
 The command is intentionally unified so callers do not need to distinguish creation from reuse. Creating from the current `HEAD` preserves the context of the project directory that invoked the command. Refusing dirty source and target worktrees prevents silent loss of changes.
 
@@ -72,7 +72,7 @@ The command is intentionally unified so callers do not need to distinguish creat
 
 ## Consequences
 
-The CLI owns a predictable user-level storage tree distributed across XDG directories and can find managed state without adding files to the source repository. Users must use the CLI's removal flow to clean managed worktrees. Removing a clean worktree also removes its branch and any commits reachable only from that branch, so removal is intentionally destructive at the branch level. The path includes an opaque identifier, which is less readable than a basename-only layout but avoids collisions. The rebrand is a hard cutover: existing `~/.tony` state must be migrated to `~/.david` before using the `david` binary, and the runtime does not retain the old storage root as a supported namespace. The XDG migration is a transitional period: the CLI reads legacy `~/.david` data with a compatibility fallback and provides an explicit `david migrate` command for moving to XDG locations. Legacy `~/.david` compatibility reads will eventually be removed.
+The CLI owns a predictable user-level storage tree distributed across XDG directories and can find managed state without adding files to the source repository. Users must use the CLI's removal flow to clean managed worktrees. Removing a clean worktree also removes its branch and any commits reachable only from that branch, so removal is intentionally destructive at the branch level. The path includes an opaque identifier, which is less readable than a basename-only layout but avoids collisions. The CLI reads existing `~/.david` data with a compatibility fallback and provides an explicit `david migrate` command for moving it to XDG locations. Compatibility reads will eventually be removed.
 
 ## Enforcement
 

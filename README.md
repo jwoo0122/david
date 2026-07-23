@@ -1,38 +1,48 @@
 # david
 
-`david` creates Git worktrees in a user-level directory and runs configured agents in attachable tmux sessions.
-
-## Prerequisites
-
-- Git
-- tmux 3.2 or newer
-- Rust and Cargo for building
-
-The first version targets macOS and Linux.
-
-David-managed sessions do not load `~/.tmux.conf`; david explicitly enables session-scoped mouse support and server-scoped extended keys for them. The latter affects other sessions sharing the tmux server; use a separate server if that is unacceptable.
+`david` creates Git worktrees in a user-level directory and runs configured agents in persistent tmux sessions.
 
 ## Install
 
-Install the prebuilt binary with Homebrew:
+Supported platforms are macOS and Linux. Install one of the following:
 
-```text
+### Homebrew
+
+```sh
 brew install jwoo0122/tap/david
 ```
 
-Alternatively, install from crates.io with Cargo:
+This installs a prebuilt binary. Git and tmux 3.2 or newer are also required.
 
-```text
+### Cargo
+
+```sh
 cargo install david
 ```
 
-## Migrating from tony
+Cargo installation additionally requires Rust and Cargo.
 
-This is a hard rebrand. `david` reads `~/.david` and manages `david-...` tmux sessions; it does not read the old `tony` namespace. Existing `tony` state must be migrated before the first `david` run.
+## Configuration
 
-## Agent configuration
+Configuration, worktrees, and session state follow the XDG Base Directory layout:
 
-Create `~/.david/config.toml`:
+| Data | Path |
+| --- | --- |
+| Configuration | `$XDG_CONFIG_HOME/david/config.toml` or `~/.config/david/config.toml` |
+| Worktrees | `$XDG_DATA_HOME/david/worktrees/<repo-id>/<worktree>` or `~/.local/share/david/worktrees/<repo-id>/<worktree>` |
+| Session state | `$XDG_STATE_HOME/david/sessions/` or `~/.local/state/david/sessions/` |
+
+Only absolute XDG paths are used; relative values fall back to the paths above.
+
+Create or update the configuration interactively:
+
+```sh
+david setup
+```
+
+`setup` can run from any directory. It merges with the existing agent list, replaces an agent when its name is entered again, and preserves `default_agent`.
+
+You can also edit `config.toml` directly:
 
 ```toml
 default_agent = "codex"
@@ -46,129 +56,97 @@ command = "claude"
 args = []
 ```
 
-`default_agent`, when present, must name one of the configured `[agents.<name>]` entries. Commands are executed directly, not through a shell. Put persistent flags in `args`.
+`default_agent`, when present, must name a configured agent. Commands run directly rather than through a shell. Put persistent flags in `args`.
 
-## First-time setup
+If data is still stored in `~/.david`, move it to the XDG locations with:
 
-Run setup from any directory:
-
-```text
-david setup
+```sh
+david migrate
+# Preview the changes without modifying files.
+david migrate --dry-run
 ```
 
-It asks for an agent name, command, and optional arguments. Enter arguments as one shell-like line, for example `--model gpt-5 --profile "fast mode"`. After each agent, the complete configured list is shown. Press `Enter` at the agent-name prompt to finish. Existing agents are preserved, and entering the same name updates that agent.
+Migration does not overwrite existing destination files. Resolve any reported conflict and retry.
 
-## Usage
+## Features and usage
 
-Run from any directory inside the source Git repository:
+### Create or reuse a worktree
 
-```text
+Run from a directory inside the source Git repository:
+
+```sh
 david run feature-login
 ```
 
-When called without a worktree name in an interactive terminal, a picker lists existing managed worktrees with their agent and session status, plus a "New worktree..." option. Selecting an existing worktree reuses or attaches to its session; selecting "New worktree..." prompts for a name, then creates the worktree and resolves the agent in the same order as below. In a non-interactive context, a worktree name is required.
+When the worktree does not exist, `david` creates it from the current `HEAD`, on a same-named branch, under the configured data directory. The source repository must be clean. Existing worktrees and their live managed sessions are reused.
 
-If the worktree does not exist, `david` creates a new branch from the current `HEAD` at:
+Agent selection, in order:
 
-```text
-~/.david/worktrees/<repo-id>/feature-login
-```
-
-If a live managed session already exists, `run` reuses it without selecting an agent. Otherwise the agent is resolved in this order:
-
-1. `--agent <name>` / `-a`
+1. `--agent <name>` or `-a <name>`
 2. `DAVID_AGENT`
-3. `default_agent` in the config
-4. the sole configured agent
-5. the interactive picker, only when interaction is enabled and both stdin and stderr are terminals
+3. `default_agent` in the configuration
+4. The sole configured agent
+5. An interactive picker, when terminal interaction is available
 
-An unknown explicit agent fails without opening the picker. In a non-interactive run, no picker or terminal attachment is attempted; a missing selection fails immediately with exit code `2`. Use `--no-interactive` to enforce this even from a terminal. Use `--detach`/`-d` to create or reuse the session and return without attaching:
+A live session is reused before agent selection. Without a worktree name, `run` opens an interactive picker when possible; non-interactive runs require a name. Use `--no-interactive` to disable terminal interaction and `--detach`/`-d` to create or reuse a session without attaching:
 
-```text
+```sh
 david run -a codex -d feature-login
 DAVID_AGENT=claude david run feature-login -- --model sonnet
 ```
 
-Arguments after `--` are appended to the configured `args` and passed as literal argv values, without shell interpretation:
+Arguments after `--` are appended to the configured command as literal argv values:
 
-```text
+```sh
 david run -a codex feature-login -- --model gpt-5.6
 ```
 
-Attach explicitly only to an existing managed session:
+### Attach and send prompts
 
-```text
+Attach only to an existing managed session:
+
+```sh
 david attach feature-login
 ```
 
-`attach` never creates a worktree or session, selects an agent, or starts a process. During an in-progress rebase, `run` and `attach` still require the rebase metadata to identify the expected worktree branch and a matching live managed session with a live agent pane; arbitrary detached, wrong-branch, or dead-pane sessions are rejected.
+Send a prompt without attaching or starting a session:
 
-Send a prompt to an existing live managed agent session:
-
-```text
+```sh
 david prompt feature-login "Review the failing tests"
 ```
 
-The single `message` argument is delivered exactly as received, including spaces, quotes, shell metacharacters, Unicode, and multiline content, then submitted. Quote or escape it for your shell; shell parsing happens before `david` receives it. Use `--` before a message that is itself a CLI option, for example `david prompt feature-login -- --help`. `david prompt` does not attach to, start, or select an agent. It fails if `<worktree>` is not an existing managed worktree on its expected branch, if the corresponding session is missing, stopped, unmanaged, or has mismatched metadata, or if tmux is unavailable or cannot deliver the prompt.
+The message is delivered exactly as received, including Unicode and newlines. Quote it for your shell; shell parsing happens before `david` receives it.
 
-List managed worktrees and agents:
+### Inspect managed worktrees
 
-```text
+List worktrees and session status:
+
+```sh
 david list
-```
-
-The default table is intended for human use. For automation, use porcelain output:
-
-```text
+# Stable machine-readable output:
 david list --porcelain
-# Add -z for NUL-terminated fields and records.
 david list --porcelain -z
 ```
 
-Each porcelain record contains these fields in this order:
+Print one worktree's absolute path without querying tmux:
 
-```text
-name <task-name>
-branch <branch-or-(detached)>
-agent <running-agent-or->
-session <active|inactive|unknown>
-path <absolute-worktree-path>
-```
-
-LF output terminates fields and records are separated by one additional LF. NUL output terminates fields and uses one additional NUL only between records; embedded newlines in values are preserved. An empty porcelain list writes zero bytes.
-
-Print one managed worktree path without starting or querying tmux:
-
-```text
+```sh
 david path feature-login
-# Add -0 for one NUL terminator.
 david path -0 feature-login
 ```
 
-`david path` requires an existing managed worktree on its same-named branch and writes only its absolute path plus the selected terminator.
+### Remove a worktree
 
-Exit statuses are `0` for successful commands, `1` for Git/tmux/filesystem and other runtime errors, and `2` for malformed command lines rejected by Clap. In particular, `david list -z` is rejected; `-z` is valid only with `--porcelain`.
+Removal terminates its managed session, removes the worktree, and deletes the paired local branch:
 
-While attached, the tmux status line shows the `DAVID` marker, project/worktree/agent names, and the detach shortcut. Detach without stopping the agent with `Ctrl-]`. The standard `Ctrl-b`, then `d`, sequence remains available as a fallback.
-
-Remove a clean worktree, terminate its agent session, and delete its paired local branch:
-
-```text
+```sh
 david remove feature-login
 ```
 
-Removal always terminates the agent session, removes the worktree, atomically deletes the paired
-local branch if it remains at the revision validated before removal, and then removes david's
-session metadata. Branch deletion does not require a merged branch and is not configurable:
-commits reachable only from that branch are intentionally lost, including unmerged branch-only
-commits. If the branch changes or deletion fails after the worktree is removed, david retains the
-session metadata and reports the failure.
+A dirty worktree is rejected unless `--force` is supplied. Branch deletion does not require a merge, so branch-only commits may be lost. `--force` applies to uncommitted worktree changes, not branch deletion.
 
-Without `--force`, removal rejects a worktree with uncommitted changes. With it, those changes
-may be discarded; it is not needed for a clean worktree, even when its branch is unmerged. Use
-either argument order:
+### tmux sessions
 
-```text
-david remove feature-login --force
-david remove --force feature-login
-```
+Each worktree has at most one managed agent session. `david` uses a dedicated tmux server, does not load `~/.tmux.conf`, and explicitly configures session styling and interaction options. Detach with `Ctrl-]`; `Ctrl-b`, then `d`, remains available as a fallback.
+
+Commands return `0` on success, `1` for runtime errors, and `2` for invalid command lines or unavailable agent selection.
