@@ -1,4 +1,8 @@
-# david
+<p align="center">
+  <img src="./logo.png" alt="david" width="80">
+</p>
+
+<h1 align="center">David</h1>
 
 `david` creates Git worktrees in a user-level directory and runs configured agents in attachable tmux sessions.
 
