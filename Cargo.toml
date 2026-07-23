@@ -1,6 +1,6 @@
 [package]
 name = "david"
-version = "1.6.1"
+version = "1.7.0"
 edition = "2024"
 description = "Manage Git worktrees and attachable agent sessions"
 homepage = "https://github.com/jwoo0122/david"
