@@ -82,7 +82,7 @@ Run from a directory inside the source Git repository:
 david run feature-login
 ```
 
-When the worktree does not exist, `david` creates it from the current `HEAD`, on a same-named branch, under the configured data directory. The source repository must be clean. Existing worktrees and their live managed sessions are reused.
+When the worktree does not exist, `david` creates it from the current `HEAD`, on a same-named branch, under the configured data directory. Uncommitted changes in the source repository do not block creation and stay in the source repository. Existing worktrees and their live managed sessions are reused.
 
 Agent selection, in order:
 

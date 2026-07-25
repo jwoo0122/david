@@ -2020,12 +2020,6 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         let creating = existing.is_none();
         let source_head = if creating {
             let head = self.git.current_head(&root)?;
-            if self.git.source_is_dirty(&root)? {
-                return Err(ToolError::Message(
-                    "source repository has uncommitted changes; commit or stash them first"
-                        .to_owned(),
-                ));
-            }
             self.git.validate_branch(&root, name)?;
             Some(head)
         } else {
@@ -2127,12 +2121,6 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             if self.git.current_head(&root)? != expected_head {
                 return Err(ToolError::Message(
                     "source repository HEAD changed while selecting an agent".to_owned(),
-                ));
-            }
-            if self.git.source_is_dirty(&root)? {
-                return Err(ToolError::Message(
-                    "source repository has uncommitted changes; commit or stash them first"
-                        .to_owned(),
                 ));
             }
             self.paths.prepare()?;
@@ -4799,6 +4787,26 @@ mod tests {
         assert!(!target.exists());
         assert!(!state_path.exists());
         assert_eq!(sessions.state.borrow().killed, vec![session]);
+    }
+
+    #[test]
+    fn run_creates_a_worktree_from_a_dirty_source_and_leaves_the_changes_behind() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions.clone());
+        fs::write(repo.path().join("uncommitted.txt"), "change\n").unwrap();
+        assert!(Git::default().source_is_dirty(repo.path()).unwrap());
+
+        app.run(repo.path(), "feature").unwrap();
+
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        let target = paths.worktree_path(&repo_id, "feature");
+        assert!(target.is_dir());
+        assert!(!target.join("uncommitted.txt").exists());
+        assert!(repo.path().join("uncommitted.txt").exists());
+        assert!(Git::default().source_is_dirty(repo.path()).unwrap());
     }
 
     #[test]

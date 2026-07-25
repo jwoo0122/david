@@ -23,7 +23,7 @@ enforcement:
       - 'fn repository_ids_are_stable_and_distinguish_paths()'
     must_not_contain: []
 enforcement_exception: null
-last_reviewed: "2026-07-22"
+last_reviewed: "2026-07-25"
 ---
 
 # Managed worktree storage and lifecycle
@@ -44,7 +44,7 @@ XDG environment variables MUST be honored only when they specify absolute paths.
 
 The repository identity MUST include a stable identifier derived from the canonical Git common directory so linked worktrees of one repository share an identity while separate clones cannot collide.
 
-`run <worktree-name>` MUST create the named worktree from the current `HEAD` on a new branch with the same name when it does not exist, and MUST reuse it when it does exist. The source repository MUST be clean before creation. A managed worktree normally reports that same branch, but an in-progress rebase may temporarily report detached HEAD; that state is valid only for reattaching to its already-live matching managed session, not for creating or starting a replacement session. `remove <worktree-name>` MUST refuse a dirty worktree unless `--force` is supplied, then MUST delete the paired branch after removing the worktree. A later `run` with the same name therefore creates a fresh branch from the then-current `HEAD`.
+`run <worktree-name>` MUST create the named worktree from the current `HEAD` on a new branch with the same name when it does not exist, and MUST reuse it when it does exist. Creation MUST NOT require a clean source repository; uncommitted source changes are left in the source repository. A managed worktree normally reports that same branch, but an in-progress rebase may temporarily report detached HEAD; that state is valid only for reattaching to its already-live matching managed session, not for creating or starting a replacement session. `remove <worktree-name>` MUST refuse a dirty worktree unless `--force` is supplied, then MUST delete the paired branch after removing the worktree. A later `run` with the same name therefore creates a fresh branch from the then-current `HEAD`.
 
 ## Context and forces
 
@@ -52,7 +52,7 @@ Sibling directories make managed checkouts visible beside every project and can 
 
 The XDG Base Directory specification separates configuration, data, and state per their distinct lifecycles and ownership. A single hidden root mixes them, making backup, cleanup, and compliance with platform conventions harder. XDG locations are therefore preferred.
 
-The command is intentionally unified so callers do not need to distinguish creation from reuse. Creating from the current `HEAD` preserves the context of the project directory that invoked the command. Refusing dirty source and target worktrees prevents silent loss of changes.
+The command is intentionally unified so callers do not need to distinguish creation from reuse. Creating from the current `HEAD` preserves the context of the project directory that invoked the command. Because `git worktree add` checks out a commit and never touches the source working tree, a dirty source cannot lose changes and MUST NOT block creation. Refusing a dirty target worktree on removal still prevents silent loss of changes.
 
 ## Invariants
 
@@ -62,7 +62,7 @@ The command is intentionally unified so callers do not need to distinguish creat
 - Creation MUST use the current `HEAD` and a new branch named for the worktree.
 - The worktree name and its branch name MUST match whenever Git reports an attached branch.
 - A detached worktree MUST not be treated as its expected branch unless an in-progress rebase records that branch and a matching managed session is already live.
-- A dirty source repository MUST not be used to create a managed worktree.
+- A dirty source repository MUST NOT block creation of a managed worktree, and its uncommitted changes MUST NOT be carried into the new worktree.
 - Default removal MUST leave a dirty worktree and its process state untouched.
 - Removal MUST delete the paired branch only after the worktree has been removed.
 - Forced removal MUST be explicit and MUST remove the worktree after its managed agent session is terminated.
@@ -88,7 +88,7 @@ The CLI owns a predictable user-level storage tree distributed across XDG direct
 
 ## Enforcement
 
-Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, rebase-detached session reattachment, arbitrary-detached and wrong-branch rejection, dirty-source rejection, reuse, dirty-removal rejection, branch deletion, and explicit forced removal. Tests MUST also verify XDG env var resolution including absolute-path enforcement, legacy `~/.david` compatibility reads, `david migrate` behavior, non-overwriting migration, mid-operation failure safety, and empty-only source removal.
+Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, rebase-detached session reattachment, arbitrary-detached and wrong-branch rejection, dirty-source creation, reuse, dirty-removal rejection, branch deletion, and explicit forced removal. Tests MUST also verify XDG env var resolution including absolute-path enforcement, legacy `~/.david` compatibility reads, `david migrate` behavior, non-overwriting migration, mid-operation failure safety, and empty-only source removal.
 
 ## Revisit when
 
