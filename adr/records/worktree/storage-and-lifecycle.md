@@ -11,6 +11,18 @@ constrains: []
 depends_on: []
 supersedes: []
 superseded_by: []
+enforcement:
+  - id: xdg-storage-and-lifecycle
+    path: src/lib.rs
+    must_contain:
+      - 'Self::resolve_xdg_dir("XDG_DATA_HOME", ".local/share")?'
+      - 'Self::resolve_xdg_dir("XDG_STATE_HOME", ".local/state")?'
+      - 'Self::resolve_xdg_dir("XDG_CONFIG_HOME", ".config")?'
+      - 'fn migrate_worktrees('
+      - 'fn remove_worktree('
+      - 'fn repository_ids_are_stable_and_distinguish_paths()'
+    must_not_contain: []
+enforcement_exception: null
 last_reviewed: "2026-07-22"
 ---
 

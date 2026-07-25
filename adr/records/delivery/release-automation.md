@@ -13,6 +13,28 @@ constrains: []
 depends_on: []
 supersedes: []
 superseded_by: []
+enforcement:
+  - id: conventional-release-filter
+    path: release-plz.toml
+    must_contain:
+      - "release_commits ="
+      - "BREAKING[- ]CHANGE"
+    must_not_contain: []
+  - id: release-commit-and-handoff
+    path: .github/workflows/version-bump.yml
+    must_contain:
+      - 'git commit --allow-empty -m "chore(release): v${version}"'
+      - 'uses: ./.github/workflows/release.yml'
+    must_not_contain: []
+  - id: package-publication-targets
+    path: .github/workflows/release.yml
+    must_contain:
+      - "workflow_call:"
+      - 'repository: "jwoo0122/homebrew-tap"'
+      - 'CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}'
+      - 'HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}'
+    must_not_contain: []
+enforcement_exception: null
 last_reviewed: "2026-07-16"
 ---
 

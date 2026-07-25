@@ -183,6 +183,6 @@ EDITOR="code --wait" david edit feature-login
 
 ### tmux sessions
 
-Each worktree has at most one managed agent session. `david` uses a dedicated tmux server, does not load `~/.tmux.conf`, and explicitly configures session styling and interaction options. Detach with `Ctrl-]`; `Ctrl-b`, then `d`, remains available as a fallback.
+Each worktree has at most one managed agent session. `david` uses a dedicated tmux server, does not load `~/.tmux.conf`, and explicitly configures session styling and interaction options. Press `Ctrl-g` to choose among live sessions for the current project. Detach with `Ctrl-]`; `Ctrl-b`, then `d`, remains available as a fallback.
 
 Commands return `0` on success, `1` for runtime errors, and `2` for invalid command lines or unavailable agent selection.

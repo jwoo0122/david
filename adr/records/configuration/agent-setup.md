@@ -12,6 +12,20 @@ depends_on:
   - runtime.agent-session
 supersedes: []
 superseded_by: []
+enforcement:
+  - id: setup-runtime-and-tests
+    path: src/lib.rs
+    must_contain:
+      - 'pub fn setup(&self) -> Result<()> {'
+      - 'fn setup_merges_agents_and_scaffolds_config()'
+      - 'fn setup_rejects_empty_result_without_writing_config()'
+    must_not_contain: []
+  - id: setup-cli-dispatch
+    path: src/main.rs
+    must_contain:
+      - 'Command::Setup => paths.setup(),'
+    must_not_contain: []
+enforcement_exception: null
 last_reviewed: "2026-07-16"
 ---
 
