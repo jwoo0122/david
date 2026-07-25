@@ -1153,6 +1153,13 @@ pub trait SessionBackend {
     fn configure_session_options(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
         Ok(())
     }
+    fn configure_session_affordances(
+        &self,
+        name: &str,
+        metadata: &SessionMetadata,
+    ) -> Result<()> {
+        self.configure_session_options(name, metadata)
+    }
     fn configure_session(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
         Ok(())
     }
@@ -1379,6 +1386,10 @@ impl TmuxBackend {
             bindings.push_str(&line.replacen(&source_table, &replacement, 1));
             bindings.push('\n');
         }
+        let repository_sessions = repository_session_pattern(session)?;
+        bindings.push_str(&format!(
+            "bind-key -T {staging} C-g choose-tree -s -f '#{{&&:#{{m:{repository_sessions},#{{session_name}}}},#{{==:#{{pane_dead}},0}}}}' -F '#{{@david-worktree}} (#{{@david-agent}})'\n"
+        ));
         bindings.push_str(&format!("bind-key -T {staging} C-] detach-client\n"));
 
         let mut clear = self.command();
@@ -1769,12 +1780,26 @@ impl SessionBackend for TmuxBackend {
         self.ensure_extended_key_features()
     }
 
+    fn configure_session_affordances(
+        &self,
+        name: &str,
+        metadata: &SessionMetadata,
+    ) -> Result<()> {
+        self.configure_session_options(name, metadata)?;
+        self.configure_key_table(name)?;
+        self.set_option(
+            name,
+            "status-right",
+            "#[bg=colour251,fg=colour235] switch: Ctrl-g  detach: Ctrl-] #[bg=colour253,fg=colour235] ",
+        )?;
+        self.set_option(name, "status-right-length", "48")
+    }
+
     fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
         self.set_option(name, "@david-project", &metadata.project_name)?;
         self.set_option(name, "@david-worktree", &metadata.worktree_name)?;
         self.set_option(name, "@david-agent", &metadata.agent_name)?;
-        self.configure_session_options(name, metadata)?;
-        self.configure_key_table(name)?;
+        self.configure_session_affordances(name, metadata)?;
         self.set_option(name, "status", "on")?;
         self.set_option(name, "status-style", "bg=colour252,fg=colour235")?;
         self.set_option(name, "window-style", "fg=default,bg=default")?;
@@ -1788,12 +1813,7 @@ impl SessionBackend for TmuxBackend {
             "#[bg=colour253,fg=colour235] DAVID #[bg=colour251,fg=colour235] project: #{@david-project}  worktree: #{@david-worktree}  agent: #{@david-agent} ",
         )?;
         self.set_option(name, "status-left-length", &status_left_length(metadata))?;
-        self.set_option(
-            name,
-            "status-right",
-            "#[bg=colour251,fg=colour235] detach: Ctrl-] #[bg=colour253,fg=colour235] ",
-        )?;
-        self.set_option(name, "status-right-length", "32")
+        Ok(())
     }
 
     fn validate_session_metadata(&self, name: &str, expected: &SessionMetadata) -> Result<()> {
@@ -2065,7 +2085,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 &project_name,
             )?;
             self.sessions
-                .configure_session_options(&session, &metadata)?;
+                .configure_session_affordances(&session, &metadata)?;
             return if options.attach && options.interactive {
                 drop(_lock);
                 self.sessions.attach(&session)
@@ -2305,6 +2325,8 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             .validate_session_metadata(&session, &metadata)?;
         self.live_agent_pane(&session, &state)?;
         self.revalidate_live_session(&root, &target, name, &session, &state_path, &project_name)?;
+        self.sessions
+            .configure_session_affordances(&session, &metadata)?;
         drop(_lock);
         self.sessions.attach(&session)
     }
@@ -3041,6 +3063,24 @@ fn session_name(repo_id: &str, worktree_name: &str) -> String {
 
 fn exact_session_target(session: &str) -> String {
     format!("={session}")
+}
+
+fn repository_session_pattern(session: &str) -> Result<String> {
+    let (prefix, hash) = session.rsplit_once('-').ok_or_else(|| {
+        ToolError::Message(format!("invalid david tmux session name: {session}"))
+    })?;
+    if prefix.is_empty()
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || hash.len() != 16
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ToolError::Message(format!(
+            "invalid david tmux session name: {session}"
+        )));
+    }
+    Ok(format!("{prefix}-*"))
 }
 
 fn session_key_tables(session: &str) -> [String; 2] {
@@ -4222,6 +4262,7 @@ mod tests {
         fs::remove_file(paths.config_path()).unwrap();
         app.attach(repo.path(), "feature").unwrap();
         assert_eq!(sessions.state.borrow().created.len(), 1);
+        assert_eq!(sessions.state.borrow().configured_options.len(), 2);
         assert_eq!(sessions.state.borrow().attached.len(), 1);
     }
 
@@ -5288,7 +5329,9 @@ mod tests {
         assert_eq!(show_option("mouse"), "on");
         assert_eq!(show_server_option("extended-keys"), "on");
         let first_table = show_option("key-table");
-        backend.configure_session(&session, &metadata).unwrap();
+        backend
+            .configure_session_affordances(&session, &metadata)
+            .unwrap();
         let second_table = show_option("key-table");
         assert_ne!(first_table, second_table);
         assert_eq!(show_option("mouse"), "on");
@@ -5298,7 +5341,10 @@ mod tests {
         assert_eq!(show_option("@david-worktree"), metadata.worktree_name);
         assert_eq!(show_option("@david-agent"), metadata.agent_name);
         assert!(show_option("status-left").contains("@david-project"));
-        assert!(show_option("status-right").contains("detach: Ctrl-]"));
+        assert_eq!(show_option("status-right-length"), "48");
+        let status_right = show_option("status-right");
+        assert!(status_right.contains("switch: Ctrl-g"));
+        assert!(status_right.find("switch: Ctrl-g") < status_right.find("detach: Ctrl-]"));
 
         let table = second_table;
         assert!(session_key_tables(&session).contains(&table));
@@ -5307,6 +5353,15 @@ mod tests {
         let output = keys.output().unwrap();
         assert!(output.status.success());
         let keys = text(&output.stdout);
+        let switch = keys
+            .lines()
+            .find(|line| line.contains("C-g"))
+            .expect("Ctrl-g binding");
+        assert!(switch.contains("choose-tree -s"));
+        assert!(switch.contains(&repository_session_pattern(&session).unwrap()));
+        assert!(switch.contains("pane_dead"));
+        assert!(switch.contains("@david-worktree"));
+        assert!(switch.contains("@david-agent"));
         assert!(
             keys.lines()
                 .any(|line| { line.contains("C-]") && line.contains("detach-client") })
@@ -5337,7 +5392,7 @@ mod tests {
         assert!(output.status.success());
         let rendered = text(&output.stdout);
         let expected = format!(
-            "#[bg=colour253,fg=colour235] DAVID #[bg=colour251,fg=colour235] project: {}  worktree: {}  agent: {} |#[bg=colour251,fg=colour235] detach: Ctrl-] #[bg=colour253,fg=colour235]",
+            "#[bg=colour253,fg=colour235] DAVID #[bg=colour251,fg=colour235] project: {}  worktree: {}  agent: {} |#[bg=colour251,fg=colour235] switch: Ctrl-g  detach: Ctrl-] #[bg=colour253,fg=colour235]",
             metadata.project_name, metadata.worktree_name, metadata.agent_name
         );
         assert_eq!(rendered.trim(), expected);
@@ -5875,7 +5930,7 @@ mod tests {
         let program = directory.path().join("fake-tmux");
         fs::write(
             &program,
-            "#!/bin/sh\ncount_file=\"$0.count\"\nif [ -f \"$count_file\" ]; then count=$(cat \"$count_file\"); else count=0; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$count_file\"\nprintf '%s\\n' \"$@\" > \"$0.args.$count\"\ncase \" $* \" in\n  *\" list-sessions \"*) printf '%s\\t%s\\n' 'david-managed' 'david-managed:7' ;;\n  *\" @david-project \"*) printf '%s\\n' 'project' ;;\n  *\" @david-worktree \"*) printf '%s\\n' 'feature' ;;\n  *\" @david-agent \"*) printf '%s\\n' 'agent' ;;\n  *\" show-option \"*) printf '%s\\n' 'root' ;;\nesac\n",
+            "#!/bin/sh\ncount_file=\"$0.count\"\nif [ -f \"$count_file\" ]; then count=$(cat \"$count_file\"); else count=0; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$count_file\"\nprintf '%s\\n' \"$@\" > \"$0.args.$count\"\ncase \" $* \" in\n  *\" list-sessions \"*) printf '%s\\t%s\\n' 'david-managed-0000000000000000' 'david-managed-0000000000000000:7' ;;\n  *\" @david-project \"*) printf '%s\\n' 'project' ;;\n  *\" @david-worktree \"*) printf '%s\\n' 'feature' ;;\n  *\" @david-agent \"*) printf '%s\\n' 'agent' ;;\n  *\" show-option \"*) printf '%s\\n' 'root' ;;\nesac\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&program).unwrap().permissions();
@@ -5889,7 +5944,7 @@ mod tests {
             agent_name: "agent".to_owned(),
         };
         backend
-            .configure_session("david-managed", &metadata)
+            .configure_session("david-managed-0000000000000000", &metadata)
             .unwrap();
 
         let count: usize = fs::read_to_string(program.with_extension("count"))
@@ -5911,7 +5966,7 @@ mod tests {
             "/dev/null".to_owned(),
             "set-option".to_owned(),
             "-t".to_owned(),
-            "david-managed:7".to_owned(),
+            "david-managed-0000000000000000:7".to_owned(),
             "mouse".to_owned(),
             "on".to_owned(),
         ]));

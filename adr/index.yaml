@@ -17,6 +17,20 @@ decisions:
     supersedes: []
     superseded_by: []
     last_reviewed: '2026-07-16'
+    enforcement:
+      - id: setup-runtime-and-tests
+        path: src/lib.rs
+        must_contain:
+          - pub fn setup(&self) -> Result<()> {
+          - fn setup_merges_agents_and_scaffolds_config()
+          - fn setup_rejects_empty_result_without_writing_config()
+        must_not_contain: []
+      - id: setup-cli-dispatch
+        path: src/main.rs
+        must_contain:
+          - Command::Setup => paths.setup(),
+        must_not_contain: []
+    enforcement_exception: null
   - id: delivery.release-automation
     status: accepted
     scope: delivery
@@ -34,6 +48,28 @@ decisions:
     supersedes: []
     superseded_by: []
     last_reviewed: '2026-07-16'
+    enforcement:
+      - id: conventional-release-filter
+        path: release-plz.toml
+        must_contain:
+          - release_commits =
+          - BREAKING[- ]CHANGE
+        must_not_contain: []
+      - id: release-commit-and-handoff
+        path: .github/workflows/version-bump.yml
+        must_contain:
+          - 'git commit --allow-empty -m "chore(release): v${version}"'
+          - 'uses: ./.github/workflows/release.yml'
+        must_not_contain: []
+      - id: package-publication-targets
+        path: .github/workflows/release.yml
+        must_contain:
+          - 'workflow_call:'
+          - 'repository: "jwoo0122/homebrew-tap"'
+          - 'CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}'
+          - 'HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}'
+        must_not_contain: []
+    enforcement_exception: null
   - id: runtime.agent-session
     status: accepted
     scope: runtime
@@ -52,7 +88,20 @@ decisions:
       - worktree.storage-and-lifecycle
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-21'
+    last_reviewed: '2026-07-25'
+    enforcement:
+      - id: managed-tmux-runtime
+        path: src/lib.rs
+        must_contain:
+          - 'socket: Some("david".to_owned())'
+          - C-g choose-tree -s
+          - C-] detach-client
+          - '"@david-project"'
+          - '"@david-worktree"'
+          - '"@david-agent"'
+          - fn tmux_backend_configures_managed_session_affordances_when_tmux_is_available()
+        must_not_contain: []
+    enforcement_exception: null
   - id: worktree.storage-and-lifecycle
     status: accepted
     scope: worktree
@@ -68,3 +117,15 @@ decisions:
     supersedes: []
     superseded_by: []
     last_reviewed: '2026-07-22'
+    enforcement:
+      - id: xdg-storage-and-lifecycle
+        path: src/lib.rs
+        must_contain:
+          - Self::resolve_xdg_dir("XDG_DATA_HOME", ".local/share")?
+          - Self::resolve_xdg_dir("XDG_STATE_HOME", ".local/state")?
+          - Self::resolve_xdg_dir("XDG_CONFIG_HOME", ".config")?
+          - fn migrate_worktrees(
+          - fn remove_worktree(
+          - fn repository_ids_are_stable_and_distinguish_paths()
+        must_not_contain: []
+    enforcement_exception: null

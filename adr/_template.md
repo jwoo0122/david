@@ -11,6 +11,8 @@ depends_on: []
 supersedes: []
 superseded_by: []
 last_reviewed: "YYYY-MM-DD"
+enforcement: []
+enforcement_exception: null
 ---
 
 # Stable question
