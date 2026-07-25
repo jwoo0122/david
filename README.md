@@ -105,6 +105,28 @@ Arguments after `--` are appended to the configured command as literal argv valu
 david run -a codex feature-login -- --model gpt-5.6
 ```
 
+### Shell completion
+
+David provides dynamic completion for managed worktree names in Bash, Zsh, Fish, and PowerShell. The completion script calls the installed binary while completing, so newly created or removed worktrees are reflected without regenerating a file.
+
+Source it from your shell startup file:
+
+```sh
+# Bash
+source <(COMPLETE=bash david)
+
+# Zsh
+source <(COMPLETE=zsh david)
+
+# Fish
+COMPLETE=fish david | source
+
+# PowerShell
+$env:COMPLETE = "powershell"; david | Out-String | Invoke-Expression; Remove-Item Env:COMPLETE
+```
+
+The same completion is available for `david run`, `david remove`, and `david edit`.
+
 ### Attach and send prompts
 
 Attach only to an existing managed session:
@@ -148,6 +170,16 @@ david remove feature-login
 ```
 
 A dirty worktree is rejected unless `--force` is supplied. Branch deletion does not require a merge, so branch-only commits may be lost. `--force` applies to uncommitted worktree changes, not branch deletion.
+
+### Edit a worktree
+
+Open an existing managed worktree with the command in `EDITOR`:
+
+```sh
+EDITOR="code --wait" david edit feature-login
+```
+
+`EDITOR` is parsed as shell-style arguments and executed directly, without an intermediate shell. David appends the absolute worktree directory as the final argument and waits for the editor to exit.
 
 ### tmux sessions
 

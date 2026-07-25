@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{engine::CompletionCandidate, CompleteEnv};
 use david::{App, DavidPaths, Git, Result, RunOptions, TmuxBackend, ToolError};
 use std::{env, io, io::IsTerminal};
 
@@ -26,6 +27,7 @@ enum Command {
     /// Create or reuse a worktree and attach to its agent session.
     Run {
         /// Name of the managed worktree. If omitted in an interactive terminal, a picker is shown.
+        #[arg(add = clap_complete::ArgValueCompleter::new(worktree_completions))]
         name: Option<String>,
         /// Select a configured agent without opening the picker.
         #[arg(short = 'a', long)]
@@ -39,6 +41,12 @@ enum Command {
         /// Arguments appended to the configured agent command.
         #[arg(last = true, allow_hyphen_values = true)]
         agent_args: Vec<String>,
+    },
+    /// Open a managed worktree in the program named by EDITOR.
+    Edit {
+        /// Name of the existing managed worktree.
+        #[arg(add = clap_complete::ArgValueCompleter::new(worktree_completions))]
+        worktree: String,
     },
     /// Attach to an existing managed agent session.
     Attach { name: String },
@@ -79,12 +87,31 @@ enum Command {
     ///
     /// Both `david remove <name> --force` and `david remove --force <name>` are supported.
     Remove {
+        #[arg(add = clap_complete::ArgValueCompleter::new(worktree_completions))]
         name: String,
         /// Discard uncommitted worktree changes; without it, dirty worktrees are rejected. It
         /// does not control branch deletion.
         #[arg(long)]
         force: bool,
     },
+}
+
+fn worktree_completions(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let Ok(paths) = DavidPaths::from_env() else {
+        return Vec::new();
+    };
+    let Ok(cwd) = env::current_dir() else {
+        return Vec::new();
+    };
+    let Ok(names) = paths.worktree_names(&cwd) else {
+        return Vec::new();
+    };
+    let current = current.to_string_lossy();
+    names
+        .into_iter()
+        .filter(|name| name.starts_with(current.as_ref()))
+        .map(CompletionCandidate::new)
+        .collect()
 }
 
 fn terminal_interaction_allowed(
@@ -140,6 +167,7 @@ fn run() -> Result<()> {
                         }
                     }
                 }
+                Command::Edit { worktree } => app.edit(&cwd, &worktree),
                 Command::Attach { name } => app.attach(&cwd, &name),
                 Command::Prompt { worktree, message } => app.prompt(&cwd, &worktree, &message),
                 Command::List { porcelain, zero } => {
@@ -166,6 +194,7 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    CompleteEnv::with_factory(Cli::command).complete();
     if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(error.exit_code());

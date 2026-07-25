@@ -30,6 +30,18 @@ fn david(home: &Path, cwd: &Path, args: &[&str], fake_tmux: Option<&Path>) -> Ou
     command.output().expect("david command")
 }
 
+fn completion(home: &Path, cwd: &Path, shell: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_david"))
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
+        .env("COMPLETE", shell)
+        .output()
+        .expect("david completion")
+}
+
 fn init_repo() -> TempDir {
     let directory = tempfile::tempdir().expect("temp repo");
     run_git(directory.path(), &["init", "-q"]);
@@ -138,6 +150,22 @@ fn fake_tmux_without_sessions() -> TempDir {
 }
 
 #[test]
+fn dynamic_completion_registration_is_available_for_supported_shells() {
+    let repo = init_repo();
+    let home = tempfile::tempdir().unwrap();
+
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        let output = completion(home.path(), repo.path(), shell);
+        assert_eq!(output.status.code(), Some(0), "shell: {shell}");
+        assert!(output.stderr.is_empty(), "shell: {shell}");
+        let script = String::from_utf8_lossy(&output.stdout);
+        assert!(!script.is_empty(), "shell: {shell}");
+        assert!(script.contains("COMPLETE"), "shell: {shell}");
+        assert!(script.contains(shell), "shell: {shell}");
+    }
+}
+
+#[test]
 fn list_human_bytes_and_empty_porcelain_output_are_stable() {
     let repo = init_repo();
     let home = tempfile::tempdir().unwrap();
@@ -209,6 +237,50 @@ fn path_outputs_lf_or_nul_and_rejects_missing_worktrees() {
         missing.stderr,
         b"error: managed worktree does not exist: missing\n"
     );
+}
+
+#[test]
+fn edit_runs_editor_with_shell_style_arguments_and_worktree_path() {
+    let repo = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    let target = home
+        .path()
+        .join(".local")
+        .join("share")
+        .join("david")
+        .join("worktrees")
+        .join(repository_id(repo.path()))
+        .join("feature");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    add_worktree(repo.path(), &target, "feature");
+
+    let log = home.path().join("editor-args");
+    let editor = home.path().join("editor.sh");
+    fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '%s\n' \"$@\" > \"$DAVID_EDIT_LOG\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&editor).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&editor, permissions).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_david"));
+    command
+        .current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local").join("share"))
+        .env("XDG_STATE_HOME", home.path().join(".local").join("state"))
+        .env("DAVID_EDIT_LOG", &log)
+        .env("EDITOR", format!("{} --wait", editor.display()))
+        .args(["edit", "feature"]);
+    let output = command.output().expect("david edit");
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    let expected = fs::canonicalize(target).unwrap();
+    assert_eq!(fs::read_to_string(log).unwrap(), format!("--wait\n{}\n", expected.display()));
 }
 
 #[test]

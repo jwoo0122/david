@@ -9,6 +9,7 @@ repository = "https://github.com/jwoo0122/david"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 dialoguer = { version = "0.12", default-features = false }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -339,6 +339,30 @@ impl DavidPaths {
         WorktreeLock::acquire(&self.worktree_lock_path(repo_id, name))
     }
 
+    pub fn worktree_names(&self, cwd: &Path) -> Result<Vec<String>> {
+        let git = Git::default();
+        let root = git.repository_root(cwd)?;
+        let repo_id = git.repository_id(&root)?;
+        let base = fs::canonicalize(self.repository_worktrees(&repo_id))
+            .unwrap_or_else(|_| self.repository_worktrees(&repo_id));
+        let mut names = Vec::new();
+
+        for worktree in git.worktrees(&root)? {
+            let Some(relative) = worktree.path.strip_prefix(&base).ok() else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let name = relative.to_string_lossy().into_owned();
+            if self.validate_worktree_path(&repo_id, &name).is_ok() {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     fn validate_worktree_path(&self, repo_id: &str, name: &str) -> Result<()> {
         let path_error = || {
             ToolError::Message(format!(
@@ -2494,7 +2518,27 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
     }
 
-    pub fn path<W: Write>(&self, cwd: &Path, name: &str, zero: bool, output: &mut W) -> Result<()> {
+    pub fn edit(&self, cwd: &Path, name: &str) -> Result<()> {
+        let path = self.managed_worktree_path(cwd, name)?;
+        let editor = env::var("EDITOR")
+            .map_err(|_| ToolError::Message("EDITOR is not set".to_owned()))?;
+        let command = shell_words::split(&editor)
+            .map_err(|error| ToolError::Message(format!("invalid EDITOR value: {error}")))?;
+        let Some((program, args)) = command.split_first() else {
+            return Err(ToolError::Message("EDITOR is empty".to_owned()));
+        };
+
+        let status = Command::new(program).args(args).arg(&path).status()?;
+        if !status.success() {
+            return Err(ToolError::Command {
+                program: program.clone(),
+                detail: status.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn managed_worktree_path(&self, cwd: &Path, name: &str) -> Result<PathBuf> {
         validate_worktree_name(name)?;
 
         let root = self.git.repository_root(cwd)?;
@@ -2509,8 +2553,11 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                 "managed worktree {name} is not attached to its expected branch"
             )));
         }
+        Ok(fs::canonicalize(&worktree.path)?)
+    }
 
-        let path = fs::canonicalize(&worktree.path)?;
+    pub fn path<W: Write>(&self, cwd: &Path, name: &str, zero: bool, output: &mut W) -> Result<()> {
+        let path = self.managed_worktree_path(cwd, name)?;
         #[cfg(unix)]
         output.write_all(path.as_os_str().as_bytes())?;
         #[cfg(not(unix))]
@@ -3991,6 +4038,17 @@ mod tests {
         let mut empty = Vec::new();
         write_porcelain_list(&[], false, &mut empty).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn worktree_names_returns_managed_names_without_session_lookup() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let app = test_app(paths.clone(), FakeSessions::default());
+        app.run(repo.path(), "feature").unwrap();
+
+        assert_eq!(paths.worktree_names(repo.path()).unwrap(), ["feature"]);
     }
 
     #[test]
