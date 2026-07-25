@@ -70,6 +70,28 @@ Run from any directory inside the source Git repository:
 david run feature-login
 ```
 
+### Shell completion
+
+David provides dynamic completion for managed worktree names in Bash, Zsh, Fish, and PowerShell. The completion script calls the installed binary while completing, so newly created or removed worktrees are reflected without regenerating a file.
+
+Source it from your shell startup file:
+
+```sh
+# Bash
+source <(COMPLETE=bash david)
+
+# Zsh
+source <(COMPLETE=zsh david)
+
+# Fish
+COMPLETE=fish david | source
+
+# PowerShell
+$env:COMPLETE = "powershell"; david | Out-String | Invoke-Expression; Remove-Item Env:COMPLETE
+```
+
+The same completion is available for `david run`, `david remove`, and `david edit`.
+
 When called without a worktree name in an interactive terminal, a picker lists existing managed worktrees with their agent and session status, plus a "New worktree..." option. Selecting an existing worktree reuses or attaches to its session; selecting "New worktree..." prompts for a name, then creates the worktree and resolves the agent in the same order as below. In a non-interactive context, a worktree name is required.
 
 If the worktree does not exist, `david` creates a new branch from the current `HEAD` at:
@@ -176,3 +198,7 @@ either argument order:
 david remove feature-login --force
 david remove --force feature-login
 ```
+
+## Editing a worktree
+
+Open an existing managed worktree with `EDITOR`; David appends its absolute directory as the final argument.
