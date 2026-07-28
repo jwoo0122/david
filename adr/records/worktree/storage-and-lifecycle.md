@@ -44,7 +44,7 @@ XDG environment variables MUST be honored only when they specify absolute paths.
 
 The repository identity MUST include a stable identifier derived from the canonical Git common directory so linked worktrees of one repository share an identity while separate clones cannot collide.
 
-`run <worktree-name>` MUST create the named worktree from the current `HEAD` on a new branch with the same name when it does not exist, and MUST reuse it when it does exist. Creation MUST NOT require a clean source repository; uncommitted source changes are left in the source repository. A managed worktree normally reports that same branch, but an in-progress rebase may temporarily report detached HEAD; that state is valid only for reattaching to its already-live matching managed session, not for creating or starting a replacement session. `remove <worktree-name>` MUST refuse a dirty worktree unless `--force` is supplied, then MUST delete the paired branch after removing the worktree. A later `run` with the same name therefore creates a fresh branch from the then-current `HEAD`.
+`run <worktree-name>` MUST create the named worktree from the current `HEAD` on a new branch with the same name when it does not exist, and MUST reuse it when it does exist. Creation MUST NOT require a clean source repository; uncommitted source changes are left in the source repository. A managed worktree normally reports that same branch, but an in-progress rebase may temporarily report detached HEAD; that state is valid only for reattaching to its already-live matching managed session, not for creating or starting a replacement session. `remove <worktree-name>...` MUST refuse each dirty worktree unless `--force` is supplied, then MUST delete each paired branch after removing its worktree. `cleanup` MUST apply that same removal lifecycle to every managed worktree for the current repository. A later `run` with the same name therefore creates a fresh branch from the then-current `HEAD`.
 
 ## Context and forces
 
@@ -63,7 +63,9 @@ The command is intentionally unified so callers do not need to distinguish creat
 - The worktree name and its branch name MUST match whenever Git reports an attached branch.
 - A detached worktree MUST not be treated as its expected branch unless an in-progress rebase records that branch and a matching managed session is already live.
 - A dirty source repository MUST NOT block creation of a managed worktree, and its uncommitted changes MUST NOT be carried into the new worktree.
+- `list`, porcelain output, and the interactive `run` selector MUST report dirty managed worktrees, including tracked and untracked changes; terminal views MUST style dirty entries distinctly.
 - Default removal MUST leave a dirty worktree and its process state untouched.
+- Multi-worktree removal and repository cleanup MUST attempt every selected managed worktree and report any individual failures together.
 - Removal MUST delete the paired branch only after the worktree has been removed.
 - Forced removal MUST be explicit and MUST remove the worktree after its managed agent session is terminated.
 - XDG environment variables MUST be honored only when they are absolute paths; relative values MUST be ignored and the fallback path used.
@@ -88,7 +90,7 @@ The CLI owns a predictable user-level storage tree distributed across XDG direct
 
 ## Enforcement
 
-Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, rebase-detached session reattachment, arbitrary-detached and wrong-branch rejection, dirty-source creation, reuse, dirty-removal rejection, branch deletion, and explicit forced removal. Tests MUST also verify XDG env var resolution including absolute-path enforcement, legacy `~/.david` compatibility reads, `david migrate` behavior, non-overwriting migration, mid-operation failure safety, and empty-only source removal.
+Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, rebase-detached session reattachment, arbitrary-detached and wrong-branch rejection, dirty-source creation, reuse, dirty status in list and interactive selection, dirty-removal rejection, branch deletion, explicit forced removal, multi-worktree removal, and repository cleanup. Tests MUST also verify XDG env var resolution including absolute-path enforcement, legacy `~/.david` compatibility reads, `david migrate` behavior, non-overwriting migration, mid-operation failure safety, and empty-only source removal.
 
 ## Revisit when
 

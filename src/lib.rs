@@ -1,7 +1,7 @@
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
@@ -972,6 +972,7 @@ struct ManagedWorktree {
     branch: String,
     agent: String,
     session: SessionStatus,
+    dirty: bool,
     path: PathBuf,
 }
 
@@ -1053,6 +1054,30 @@ pub fn parse_worktree_list(input: &str) -> Vec<Worktree> {
     worktrees
 }
 
+fn interactive_worktree_label(entry: &ManagedWorktree, colored: bool) -> String {
+    let label = format!(
+        "{} ({}) [{} · {}{}]",
+        entry.name,
+        entry.branch,
+        entry.agent,
+        entry.session.as_str(),
+        if entry.dirty { " · dirty" } else { "" }
+    );
+    if !colored {
+        return label;
+    }
+    let color = if entry.dirty {
+        "\x1b[31m"
+    } else {
+        match entry.session {
+            SessionStatus::Active => "\x1b[32m",
+            SessionStatus::Unknown => "\x1b[33m",
+            SessionStatus::Inactive => "\x1b[90m",
+        }
+    };
+    format!("{color}{label}\x1b[0m")
+}
+
 fn write_porcelain_list<W: Write>(
     entries: &[ManagedWorktree],
     zero: bool,
@@ -1067,6 +1092,12 @@ fn write_porcelain_list<W: Write>(
         write_porcelain_field(output, b"branch ", &entry.branch, delimiter)?;
         write_porcelain_field(output, b"agent ", &entry.agent, delimiter)?;
         write_porcelain_field(output, b"session ", entry.session.as_str(), delimiter)?;
+        write_porcelain_field(
+            output,
+            b"dirty ",
+            if entry.dirty { "true" } else { "false" },
+            delimiter,
+        )?;
         output.write_all(b"path ")?;
         #[cfg(unix)]
         output.write_all(entry.path.as_os_str().as_bytes())?;
@@ -2562,49 +2593,58 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             .chain(std::iter::once("STATUS".len()))
             .max()
             .unwrap();
+        let dirty_w = "DIRTY".len();
 
         let bold = if colored { "\x1b[1m" } else { "" };
         let reset = if colored { "\x1b[0m" } else { "" };
 
         writeln!(
             output,
-            "{}{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}  PATH{}",
+            "{}{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}  {:<dw$}  PATH{}",
             bold,
             "NAME",
             "BRANCH",
             "AGENT",
             "STATUS",
+            "DIRTY",
             reset,
             nw = name_w,
             bw = branch_w,
             aw = agent_w,
             sw = status_w,
+            dw = dirty_w,
         )?;
 
         for entry in &entries {
             let color = if colored {
-                match entry.session {
-                    SessionStatus::Active => "\x1b[32m",
-                    SessionStatus::Unknown => "\x1b[33m",
-                    SessionStatus::Inactive => "\x1b[90m",
+                if entry.dirty {
+                    "\x1b[31m"
+                } else {
+                    match entry.session {
+                        SessionStatus::Active => "\x1b[32m",
+                        SessionStatus::Unknown => "\x1b[33m",
+                        SessionStatus::Inactive => "\x1b[90m",
+                    }
                 }
             } else {
                 ""
             };
             writeln!(
                 output,
-                "{}{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}  {}{}",
+                "{}{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}  {:<dw$}  {}{}",
                 color,
                 entry.name,
                 entry.branch,
                 entry.agent,
                 entry.session.as_str(),
+                if entry.dirty { "dirty" } else { "clean" },
                 entry.path.display(),
                 reset,
                 nw = name_w,
                 bw = branch_w,
                 aw = agent_w,
                 sw = status_w,
+                dw = dirty_w,
             )?;
         }
         Ok(())
@@ -2624,15 +2664,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
         let labels: Vec<String> = entries
             .iter()
-            .map(|entry| {
-                format!(
-                    "{} ({}) [{} · {}]",
-                    entry.name,
-                    entry.branch,
-                    entry.agent,
-                    entry.session.as_str()
-                )
-            })
+            .map(|entry| interactive_worktree_label(entry, true))
             .chain(std::iter::once("New worktree...".to_owned()))
             .collect();
         let selection = Select::with_theme(&ColorfulTheme::default())
@@ -2738,6 +2770,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
                     .to_owned(),
                 agent,
                 session,
+                dirty: worktree.path.is_dir() && self.git.worktree_is_dirty(&worktree.path)?,
                 path: worktree.path,
             });
         }
@@ -2796,6 +2829,45 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         } else {
             Ok(("-".to_owned(), SessionStatus::Inactive))
         }
+    }
+
+    pub fn remove_many(&self, cwd: &Path, names: &[String], force: bool) -> Result<()> {
+        let root = self.git.repository_root(cwd)?;
+        let repo_id = self.git.repository_id(&root)?;
+        let managed_base = canonicalize_with_missing(&self.paths.repository_worktrees(&repo_id))?;
+        let operation_root = self
+            .git
+            .worktrees(&root)?
+            .into_iter()
+            .find(|worktree| {
+                canonicalize_with_missing(&worktree.path)
+                    .map(|path| !path.starts_with(&managed_base))
+                    .unwrap_or(false)
+            })
+            .map(|worktree| worktree.path)
+            .unwrap_or(root);
+
+        let mut seen = BTreeSet::new();
+        let mut failures = Vec::new();
+        for name in names.iter().filter(|name| seen.insert((*name).clone())) {
+            if let Err(error) = self.remove(&operation_root, name, force) {
+                failures.push(format!("{name}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ToolError::Message(format!(
+                "failed to remove {} worktree(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    pub fn cleanup(&self, cwd: &Path, force: bool) -> Result<()> {
+        let names = self.paths.worktree_names(cwd)?;
+        self.remove_many(cwd, &names, force)
     }
 
     pub fn remove(&self, cwd: &Path, name: &str, force: bool) -> Result<()> {
@@ -4269,6 +4341,7 @@ mod tests {
                 branch: "main".to_owned(),
                 agent: "codex".to_owned(),
                 session: SessionStatus::Active,
+                dirty: false,
                 path: PathBuf::from("/tmp/first"),
             },
             ManagedWorktree {
@@ -4276,6 +4349,7 @@ mod tests {
                 branch: "(detached)".to_owned(),
                 agent: "-".to_owned(),
                 session: SessionStatus::Unknown,
+                dirty: true,
                 path: PathBuf::from("/tmp/second\nwith-newline"),
             },
         ];
@@ -4284,14 +4358,14 @@ mod tests {
         write_porcelain_list(&entries, false, &mut newline).unwrap();
         assert_eq!(
             String::from_utf8(newline).unwrap(),
-            "name first\nbranch main\nagent codex\nsession active\npath /tmp/first\n\nname second\nbranch (detached)\nagent -\nsession unknown\npath /tmp/second\nwith-newline\n"
+            "name first\nbranch main\nagent codex\nsession active\ndirty false\npath /tmp/first\n\nname second\nbranch (detached)\nagent -\nsession unknown\ndirty true\npath /tmp/second\nwith-newline\n"
         );
 
         let mut nul = Vec::new();
         write_porcelain_list(&entries, true, &mut nul).unwrap();
         assert_eq!(
             nul,
-            b"name first\0branch main\0agent codex\0session active\0path /tmp/first\0\0name second\0branch (detached)\0agent -\0session unknown\0path /tmp/second\nwith-newline\0"
+            b"name first\0branch main\0agent codex\0session active\0dirty false\0path /tmp/first\0\0name second\0branch (detached)\0agent -\0session unknown\0dirty true\0path /tmp/second\nwith-newline\0"
         );
 
         let mut empty = Vec::new();
@@ -5027,6 +5101,69 @@ mod tests {
     }
 
     #[test]
+    fn interactive_worktree_labels_match_list_status_colors() {
+        let entry = |session| ManagedWorktree {
+            name: "feature".to_owned(),
+            branch: "feature".to_owned(),
+            agent: "test".to_owned(),
+            session,
+            dirty: false,
+            path: PathBuf::from("/tmp/feature"),
+        };
+
+        assert!(
+            interactive_worktree_label(&entry(SessionStatus::Active), true).starts_with("\x1b[32m")
+        );
+        assert!(
+            interactive_worktree_label(&entry(SessionStatus::Inactive), true)
+                .starts_with("\x1b[90m")
+        );
+        assert!(
+            interactive_worktree_label(&entry(SessionStatus::Unknown), true)
+                .starts_with("\x1b[33m")
+        );
+        assert_eq!(
+            interactive_worktree_label(&entry(SessionStatus::Active), false),
+            "feature (feature) [test · active]"
+        );
+    }
+
+    #[test]
+    fn remove_many_continues_after_failures_and_cleanup_removes_all_managed_worktrees() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+
+        app.run(repo.path(), "dirty").unwrap();
+        app.run(repo.path(), "clean").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        fs::write(
+            paths.worktree_path(&repo_id, "dirty").join("change"),
+            "dirty",
+        )
+        .unwrap();
+
+        let error = app
+            .remove_many(
+                repo.path(),
+                &["dirty".to_owned(), "clean".to_owned()],
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("dirty"));
+        assert!(paths.worktree_path(&repo_id, "dirty").exists());
+        assert!(!paths.worktree_path(&repo_id, "clean").exists());
+
+        app.run(repo.path(), "second").unwrap();
+        app.cleanup(repo.path(), true).unwrap();
+        assert!(app.paths.worktree_names(repo.path()).unwrap().is_empty());
+        assert!(!branch_exists(repo.path(), "dirty"));
+        assert!(!branch_exists(repo.path(), "second"));
+    }
+
+    #[test]
     fn run_creates_a_worktree_from_a_dirty_source_and_leaves_the_changes_behind() {
         let repo = init_repo();
         let home = tempfile::tempdir().unwrap();
@@ -5302,6 +5439,41 @@ mod tests {
     }
 
     #[test]
+    fn list_and_selector_labels_report_and_style_dirty_worktrees() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let app = test_app(paths.clone(), FakeSessions::default());
+        app.run(repo.path(), "feature").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        fs::write(
+            paths.worktree_path(&repo_id, "feature").join("change"),
+            "dirty",
+        )
+        .unwrap();
+
+        let entries = app.managed_worktrees(repo.path()).unwrap();
+        assert!(entries[0].dirty);
+        assert!(interactive_worktree_label(&entries[0], false).contains(" · dirty]"));
+        assert!(interactive_worktree_label(&entries[0], true).starts_with("\x1b[31m"));
+
+        let mut human = Vec::new();
+        app.list(repo.path(), true, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains("\x1b[31mfeature"));
+        assert!(human.contains("dirty"));
+
+        let mut porcelain = Vec::new();
+        app.list_porcelain(repo.path(), false, &mut porcelain)
+            .unwrap();
+        assert!(
+            String::from_utf8(porcelain)
+                .unwrap()
+                .contains("dirty true\n")
+        );
+    }
+
+    #[test]
     fn human_list_preserves_header_and_row_bytes() {
         let repo = init_repo();
         let home = tempfile::tempdir().unwrap();
@@ -5317,7 +5489,7 @@ mod tests {
         let mut output = Vec::new();
         app.list(repo.path(), false, &mut output).unwrap();
         let expected = format!(
-            "NAME     BRANCH   AGENT  STATUS  PATH\nfeature  feature  test   active  {}\n",
+            "NAME     BRANCH   AGENT  STATUS  DIRTY  PATH\nfeature  feature  test   active  clean  {}\n",
             target.display()
         );
         assert_eq!(output, expected.as_bytes());
@@ -5349,9 +5521,19 @@ mod tests {
         let mut output = Vec::new();
         app.list_porcelain(repo.path(), false, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("name active\nbranch active\nagent test\nsession active\n"));
-        assert!(output.contains("name inactive\nbranch inactive\nagent -\nsession inactive\n"));
-        assert!(output.contains("name unknown\nbranch unknown\nagent -\nsession unknown\n"));
+        assert!(
+            output
+                .contains("name active\nbranch active\nagent test\nsession active\ndirty false\n")
+        );
+        assert!(
+            output.contains(
+                "name inactive\nbranch inactive\nagent -\nsession inactive\ndirty false\n"
+            )
+        );
+        assert!(
+            output
+                .contains("name unknown\nbranch unknown\nagent -\nsession unknown\ndirty false\n")
+        );
     }
 
     #[test]
@@ -5680,7 +5862,7 @@ mod tests {
         app.list_porcelain(repo.path(), false, &mut porcelain)
             .unwrap();
         let porcelain = String::from_utf8(porcelain).unwrap();
-        assert!(porcelain.contains("agent -\nsession inactive\n"));
+        assert!(porcelain.contains("agent -\nsession inactive\ndirty false\n"));
     }
 
     #[test]
@@ -5703,7 +5885,7 @@ mod tests {
         );
         let target = fs::canonicalize(target).unwrap();
         let expected = format!(
-            "name feature\nbranch feature\nagent -\nsession inactive\npath {}\n",
+            "name feature\nbranch feature\nagent -\nsession inactive\ndirty false\npath {}\n",
             target.display()
         );
         assert_eq!(output, expected.as_bytes());
@@ -5724,8 +5906,8 @@ mod tests {
         let mut output = Vec::new();
         app.list_porcelain(repo.path(), false, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("agent -\nsession unknown\n"));
-        assert!(!output.contains("session active\n"));
+        assert!(output.contains("agent -\nsession unknown\ndirty false\n"));
+        assert!(!output.contains("session active\ndirty false\n"));
     }
 
     #[test]

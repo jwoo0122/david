@@ -309,7 +309,7 @@ fn porcelain_nul_output_preserves_a_newline_in_a_worktree_path() {
     assert_eq!(lf.status.code(), Some(0));
     assert!(lf.stderr.is_empty());
     let mut expected_lf =
-        b"name feature\nwith-newline\nbranch feature\nagent -\nsession unknown\npath ".to_vec();
+        b"name feature\nwith-newline\nbranch feature\nagent -\nsession unknown\ndirty false\npath ".to_vec();
     expected_lf.extend_from_slice(target.as_os_str().as_encoded_bytes());
     expected_lf.push(b'\n');
     assert_eq!(lf.stdout, expected_lf);
@@ -323,7 +323,7 @@ fn porcelain_nul_output_preserves_a_newline_in_a_worktree_path() {
     assert_eq!(nul.status.code(), Some(0));
     assert!(nul.stderr.is_empty());
     let mut expected_nul =
-        b"name feature\nwith-newline\0branch feature\0agent -\0session unknown\0path ".to_vec();
+        b"name feature\nwith-newline\0branch feature\0agent -\0session unknown\0dirty false\0path ".to_vec();
     expected_nul.extend_from_slice(target.as_os_str().as_encoded_bytes());
     expected_nul.push(b'\0');
     assert_eq!(nul.stdout, expected_nul);
