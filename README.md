@@ -145,7 +145,7 @@ The message is delivered exactly as received, including Unicode and newlines. Qu
 
 ### Inspect managed worktrees
 
-List worktrees and session status:
+List worktrees, session status, and whether each checkout has tracked or untracked changes. Dirty rows are highlighted in red:
 
 ```sh
 david list

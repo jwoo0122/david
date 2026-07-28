@@ -63,6 +63,7 @@ The command is intentionally unified so callers do not need to distinguish creat
 - The worktree name and its branch name MUST match whenever Git reports an attached branch.
 - A detached worktree MUST not be treated as its expected branch unless an in-progress rebase records that branch and a matching managed session is already live.
 - A dirty source repository MUST NOT block creation of a managed worktree, and its uncommitted changes MUST NOT be carried into the new worktree.
+- `list`, porcelain output, and the interactive `run` selector MUST report dirty managed worktrees, including tracked and untracked changes; terminal views MUST style dirty entries distinctly.
 - Default removal MUST leave a dirty worktree and its process state untouched.
 - Multi-worktree removal and repository cleanup MUST attempt every selected managed worktree and report any individual failures together.
 - Removal MUST delete the paired branch only after the worktree has been removed.
@@ -89,7 +90,7 @@ The CLI owns a predictable user-level storage tree distributed across XDG direct
 
 ## Enforcement
 
-Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, rebase-detached session reattachment, arbitrary-detached and wrong-branch rejection, dirty-source creation, reuse, dirty-removal rejection, branch deletion, explicit forced removal, multi-worktree removal, and repository cleanup. Tests MUST also verify XDG env var resolution including absolute-path enforcement, legacy `~/.david` compatibility reads, `david migrate` behavior, non-overwriting migration, mid-operation failure safety, and empty-only source removal.
+Integration tests MUST cover path derivation, same-basename repository separation, creation from `HEAD`, same-name branch pairing, rebase-detached session reattachment, arbitrary-detached and wrong-branch rejection, dirty-source creation, reuse, dirty status in list and interactive selection, dirty-removal rejection, branch deletion, explicit forced removal, multi-worktree removal, and repository cleanup. Tests MUST also verify XDG env var resolution including absolute-path enforcement, legacy `~/.david` compatibility reads, `david migrate` behavior, non-overwriting migration, mid-operation failure safety, and empty-only source removal.
 
 ## Revisit when
 
