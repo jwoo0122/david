@@ -447,6 +447,7 @@ struct SessionState {
     session: String,
     agent: String,
     pane: Option<String>,
+    launch_agent: Option<Agent>,
 }
 
 impl SessionState {
@@ -471,6 +472,21 @@ impl SessionState {
         if let Some(pane) = &self.pane {
             encoded.push_str("pane=");
             encoded.push_str(pane);
+            encoded.push('\n');
+        }
+        if let Some(agent) = &self.launch_agent {
+            encoded.push_str("agent_command_hex=");
+            encoded.push_str(&encode_bytes_hex(agent.command.as_bytes()));
+            encoded.push('\n');
+            encoded.push_str("agent_args_hex=");
+            encoded.push_str(
+                &agent
+                    .args
+                    .iter()
+                    .map(|argument| encode_bytes_hex(argument.as_bytes()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             encoded.push('\n');
         }
         encoded
@@ -1072,6 +1088,21 @@ fn write_porcelain_field<W: Write>(
     output.write_all(&[delimiter])
 }
 
+fn encode_bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_utf8_hex(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
 fn encode_path_hex(path: &Path) -> String {
     #[cfg(unix)]
     let bytes = path.as_os_str().as_bytes();
@@ -1165,6 +1196,15 @@ pub trait SessionBackend {
     }
     fn validate_session_metadata(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
         Ok(())
+    }
+    fn agent_started(&self, _name: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn reserve_agent_start(&self, _name: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn attach_with_agent(&self, name: &str, _pane: &str, _agent: &Agent) -> Result<()> {
+        self.attach(name)
     }
     fn attach(&self, name: &str) -> Result<()>;
     fn clear_session_affordances(&self, _name: &str) -> Result<()> {
@@ -1647,6 +1687,31 @@ impl TmuxBackend {
     }
 }
 
+impl TmuxBackend {
+    fn session_has_client(&self, target: &str) -> bool {
+        let mut clients = self.command();
+        clients
+            .args(["list-clients", "-t"])
+            .arg(target)
+            .args(["-F", "#{client_name}"]);
+        clients
+            .output()
+            .map(|output| output.status.success() && !text(&output.stdout).trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    fn start_agent(&self, name: &str, pane: &str, agent: &Agent) -> Result<()> {
+        let mut respawn = self.command();
+        respawn
+            .args(["respawn-pane", "-k", "-t"])
+            .arg(pane)
+            .arg(&agent.command)
+            .args(&agent.args);
+        self.run_command(respawn)?;
+        self.set_option(name, "@david-agent-started", "on")
+    }
+}
+
 impl SessionBackend for TmuxBackend {
     fn ensure_available(&self) -> Result<()> {
         let output = self.command().arg("-V").output().map_err(|error| {
@@ -1715,7 +1780,7 @@ impl SessionBackend for TmuxBackend {
         &self,
         name: &str,
         cwd: &Path,
-        agent: &Agent,
+        _agent: &Agent,
     ) -> Result<Option<String>> {
         let mut command = self.command();
         command
@@ -1731,8 +1796,7 @@ impl SessionBackend for TmuxBackend {
             ])
             .arg(cwd)
             .arg("--")
-            .arg(&agent.command)
-            .args(&agent.args);
+            .args(["sleep", "2147483647"]);
         let output = command.output()?;
         if !output.status.success() {
             return Err(command_error("tmux", &output));
@@ -1799,13 +1863,10 @@ impl SessionBackend for TmuxBackend {
         self.set_option(name, "@david-project", &metadata.project_name)?;
         self.set_option(name, "@david-worktree", &metadata.worktree_name)?;
         self.set_option(name, "@david-agent", &metadata.agent_name)?;
+        self.set_option(name, "@david-agent-started", "off")?;
         self.configure_session_affordances(name, metadata)?;
         self.set_option(name, "status", "on")?;
         self.set_option(name, "status-style", "bg=colour252,fg=colour235")?;
-        self.set_option(name, "window-style", "fg=default,bg=default")?;
-        self.set_option(name, "window-active-style", "fg=default,bg=default")?;
-        self.set_option(name, "pane-border-style", "fg=default,bg=default")?;
-        self.set_option(name, "pane-active-border-style", "fg=default,bg=default")?;
         self.set_option(name, "pane-border-status", "off")?;
         self.set_option(
             name,
@@ -1819,6 +1880,63 @@ impl SessionBackend for TmuxBackend {
     fn validate_session_metadata(&self, name: &str, expected: &SessionMetadata) -> Result<()> {
         let target = self.session_id(name)?;
         self.validate_session_metadata_at(name, &target, expected)
+    }
+
+    fn agent_started(&self, name: &str) -> Result<bool> {
+        match self.show_option(name, "@david-agent-started") {
+            Ok(value) => Ok(value != "off" && value != "starting"),
+            Err(_) => Ok(true),
+        }
+    }
+
+    fn reserve_agent_start(&self, name: &str) -> Result<bool> {
+        if self.show_option(name, "@david-agent-started")? != "off" {
+            return Ok(false);
+        }
+        self.set_option(name, "@david-agent-started", "starting")?;
+        Ok(true)
+    }
+
+    fn attach_with_agent(&self, name: &str, pane: &str, agent: &Agent) -> Result<()> {
+        if !valid_pane_id(pane) {
+            return Err(ToolError::Message(format!(
+                "tmux pane target is invalid: {pane}"
+            )));
+        }
+        let target = self.session_id(name)?;
+        let mut attach = self.command();
+        attach.args(["attach-session", "-t"]).arg(&target);
+        let mut child = attach.spawn()?;
+
+        let attached = (0..100).any(|_| {
+            let attached = self.session_has_client(&target);
+            if !attached {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            attached
+        });
+        if !attached {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ToolError::Message(format!(
+                "tmux client did not attach to session {name} before agent startup"
+            )));
+        }
+
+        if let Err(error) = self.start_agent(name, pane, agent) {
+            let mut detach = self.command();
+            detach.args(["detach-client", "-s", "-t"]).arg(&target);
+            let _ = detach.output();
+            let _ = child.wait();
+            let _ = self.kill_session(name);
+            return Err(error);
+        }
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(self.status_error(status))
+        }
     }
 
     fn attach(&self, name: &str) -> Result<()> {
@@ -2081,8 +2199,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             self.sessions
                 .configure_session_affordances(&session, &metadata)?;
             return if options.attach && options.interactive {
-                drop(_lock);
-                self.sessions.attach(&session)
+                self.attach_managed_session(&session, &state, _lock)
             } else {
                 Ok(())
             };
@@ -2167,6 +2284,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             session: session.clone(),
             agent: agent_name,
             pane: None,
+            launch_agent: Some(agent.clone()),
         };
         write_session_state(&state_path, &state)?;
         let pane = match self
@@ -2246,8 +2364,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             return Err(self.cleanup_error(error, &state_path, &session));
         }
         if options.attach && options.interactive {
-            drop(_lock);
-            self.sessions.attach(&session)
+            self.attach_managed_session(&session, &state, _lock)
         } else {
             Ok(())
         }
@@ -2315,8 +2432,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         self.revalidate_live_session(&root, &target, name, &session, &state_path, &project_name)?;
         self.sessions
             .configure_session_affordances(&session, &metadata)?;
-        drop(_lock);
-        self.sessions.attach(&session)
+        self.attach_managed_session(&session, &state, _lock)
     }
 
     pub fn prompt(&self, cwd: &Path, name: &str, message: &str) -> Result<()> {
@@ -2377,6 +2493,11 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         };
         self.sessions
             .validate_session_metadata(&session, &metadata)?;
+        if !self.sessions.agent_started(&session)? {
+            return Err(ToolError::Message(format!(
+                "managed agent session {session} is prepared but has not been attached"
+            )));
+        }
         let pane = self.live_agent_pane(&session, &state)?;
         self.revalidate_live_session(
             &root,
@@ -2666,7 +2787,10 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             .transpose()
             .unwrap_or_default()
             .unwrap_or(false);
-        let active = checkout_exists && branch_matches && pane_alive;
+        let active = checkout_exists
+            && branch_matches
+            && pane_alive
+            && self.sessions.agent_started(&session).unwrap_or(false);
         if active {
             Ok((state.agent, SessionStatus::Active))
         } else {
@@ -2780,6 +2904,30 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             fs::remove_file(state_path)?;
         }
         Ok(())
+    }
+
+    fn attach_managed_session(
+        &self,
+        session: &str,
+        state: &SessionState,
+        lock: WorktreeLock,
+    ) -> Result<()> {
+        let pane = self.live_agent_pane(session, state)?;
+        if self.sessions.agent_started(session)? {
+            drop(lock);
+            return self.sessions.attach(session);
+        }
+        let agent = state.launch_agent.as_ref().ok_or_else(|| {
+            ToolError::Message(format!(
+                "tmux session {session} is prepared but has no persisted agent command"
+            ))
+        })?;
+        if !self.sessions.reserve_agent_start(session)? {
+            drop(lock);
+            return self.sessions.attach(session);
+        }
+        drop(lock);
+        self.sessions.attach_with_agent(session, &pane, agent)
     }
 
     fn live_agent_pane(&self, session: &str, state: &SessionState) -> Result<String> {
@@ -3147,6 +3295,8 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
                 | "session"
                 | "agent"
                 | "pane"
+                | "agent_command_hex"
+                | "agent_args_hex"
         ) {
             return Err(ToolError::Message(format!(
                 "session metadata contains unknown field {key}: {}",
@@ -3204,6 +3354,57 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
             path.display()
         )));
     }
+    let launch_agent = match values.get("agent_command_hex") {
+        Some(command) => {
+            let command = decode_utf8_hex(command).ok_or_else(|| {
+                ToolError::Message(format!(
+                    "session metadata has an invalid pending agent command: {}",
+                    path.display()
+                ))
+            })?;
+            let args = values.get("agent_args_hex").ok_or_else(|| {
+                ToolError::Message(format!(
+                    "session metadata is missing pending agent arguments: {}",
+                    path.display()
+                ))
+            })?;
+            let args = if args.is_empty() {
+                Vec::new()
+            } else {
+                args.split(',')
+                    .map(|argument| {
+                        decode_utf8_hex(argument).ok_or_else(|| {
+                            ToolError::Message(format!(
+                                "session metadata has invalid pending agent arguments: {}",
+                                path.display()
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            if command.trim().is_empty()
+                || command.contains('\n')
+                || command.contains('\r')
+                || command.contains('\0')
+                || args.iter().any(|argument| argument.contains('\0'))
+            {
+                return Err(ToolError::Message(format!(
+                    "session metadata has an invalid pending agent command: {}",
+                    path.display()
+                )));
+            }
+            Some(Agent { command, args })
+        }
+        None => {
+            if values.contains_key("agent_args_hex") {
+                return Err(ToolError::Message(format!(
+                    "session metadata has pending agent arguments without a command: {}",
+                    path.display()
+                )));
+            }
+            None
+        }
+    };
     Ok(SessionState {
         repo_id: take("repo_id")?,
         worktree_name: take("worktree_name")?,
@@ -3212,6 +3413,7 @@ fn read_session_state(path: &Path) -> Result<SessionState> {
         session: take("session")?,
         agent,
         pane,
+        launch_agent,
     })
 }
 
@@ -3357,6 +3559,8 @@ mod tests {
         live: BTreeSet<String>,
         created: Vec<String>,
         created_agents: Vec<Agent>,
+        started_agents: Vec<Agent>,
+        started: BTreeSet<String>,
         configured: Vec<(String, SessionMetadata)>,
         configured_options: Vec<String>,
         metadata: BTreeMap<String, SessionMetadata>,
@@ -3418,6 +3622,22 @@ mod tests {
 
         fn agent_pane(&self, _name: &str) -> Result<Option<String>> {
             Ok(Some("%0".to_owned()))
+        }
+
+        fn agent_started(&self, name: &str) -> Result<bool> {
+            Ok(self.state.borrow().started.contains(name))
+        }
+
+        fn reserve_agent_start(&self, name: &str) -> Result<bool> {
+            Ok(!self.state.borrow().started.contains(name))
+        }
+
+        fn attach_with_agent(&self, name: &str, _pane: &str, agent: &Agent) -> Result<()> {
+            let mut state = self.state.borrow_mut();
+            state.started.insert(name.to_owned());
+            state.started_agents.push(agent.clone());
+            state.attached.push(name.to_owned());
+            Ok(())
         }
 
         fn attach(&self, name: &str) -> Result<()> {
@@ -3901,6 +4121,10 @@ mod tests {
             session: "david-repo-feature".to_owned(),
             agent: "test".to_owned(),
             pane: Some("%42".to_owned()),
+            launch_agent: Some(Agent {
+                command: "agent command".to_owned(),
+                args: vec!["".to_owned(), "a,b".to_owned(), "😀".to_owned()],
+            }),
         };
 
         write_session_state(&path, &state).unwrap();
@@ -3910,12 +4134,18 @@ mod tests {
         let legacy = fs::read_to_string(&path)
             .unwrap()
             .lines()
-            .filter(|line| !line.starts_with("pane="))
+            .filter(|line| {
+                !line.starts_with("pane=")
+                    && !line.starts_with("agent_command_hex=")
+                    && !line.starts_with("agent_args_hex=")
+            })
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
         fs::write(&path, legacy).unwrap();
-        assert_eq!(read_session_state(&path).unwrap().pane, None);
+        let legacy_state = read_session_state(&path).unwrap();
+        assert_eq!(legacy_state.pane, None);
+        assert_eq!(legacy_state.launch_agent, None);
     }
 
     #[cfg(unix)]
@@ -3934,6 +4164,7 @@ mod tests {
             session: "david-repo-feature".to_owned(),
             agent: "test".to_owned(),
             pane: None,
+            launch_agent: None,
         };
 
         write_session_state(&path, &state).unwrap();
@@ -4245,6 +4476,7 @@ mod tests {
             }]
         );
         assert!(sessions.state.borrow().attached.is_empty());
+        assert!(sessions.state.borrow().started_agents.is_empty());
         assert_eq!(sessions.state.borrow().created.len(), 1);
 
         fs::remove_file(paths.config_path()).unwrap();
@@ -4252,6 +4484,11 @@ mod tests {
         assert_eq!(sessions.state.borrow().created.len(), 1);
         assert_eq!(sessions.state.borrow().configured_options.len(), 2);
         assert_eq!(sessions.state.borrow().attached.len(), 1);
+        assert_eq!(sessions.state.borrow().started_agents.len(), 1);
+        assert_eq!(
+            sessions.state.borrow().started_agents,
+            sessions.state.borrow().created_agents
+        );
     }
 
     #[test]
@@ -5345,6 +5582,7 @@ mod tests {
         assert_eq!(show_option("mouse"), "on");
         assert_eq!(show_server_option("extended-keys"), "on");
         assert_eq!(show_option("status"), "on");
+        assert_eq!(show_option("status-style"), "bg=colour252,fg=colour235");
         assert_eq!(show_option("@david-project"), metadata.project_name);
         assert_eq!(show_option("@david-worktree"), metadata.worktree_name);
         assert_eq!(show_option("@david-agent"), metadata.agent_name);
@@ -5903,8 +6141,8 @@ mod tests {
                 "-c".to_owned(),
                 directory.path().to_string_lossy().into_owned(),
                 "--".to_owned(),
-                "echo".to_owned(),
-                "ready".to_owned(),
+                "sleep".to_owned(),
+                "2147483647".to_owned(),
             ]
         );
 
@@ -5986,6 +6224,19 @@ mod tests {
             "extended-keys".to_owned(),
             "on".to_owned(),
         ]));
+        for option in [
+            "window-style",
+            "window-active-style",
+            "pane-border-style",
+            "pane-active-border-style",
+        ] {
+            assert!(
+                !invocations
+                    .iter()
+                    .any(|invocation| invocation.iter().any(|argument| argument == option)),
+                "application-area style must not be configured: {option}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -6176,6 +6427,29 @@ mod tests {
         backend.create_session(&session, directory, &agent).unwrap();
         let pane = backend.agent_pane(&session).unwrap().unwrap();
         assert!(pane.starts_with('%'));
+        assert!(!output.exists());
+
+        let target = backend.session_id(&session).unwrap();
+        let mut client_command = Command::new("script");
+        client_command
+            .args(["-q", "/dev/null"])
+            .arg(&server.wrapper)
+            .args(["-f", "/dev/null", "attach-session", "-t"])
+            .arg(&target)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut client = client_command.spawn().unwrap();
+        let attached = (0..100).any(|_| {
+            let attached = backend.session_has_client(&target);
+            if !attached {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            attached
+        });
+        assert!(attached);
+        assert!(!output.exists());
+        backend.start_agent(&session, &pane, &agent).unwrap();
         let delivery = backend.deliver_prompt_to(&session, message, Some(&pane));
 
         let mut received = None;
@@ -6187,6 +6461,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         backend.kill_session(&session).unwrap();
+        let _ = client.kill();
+        let _ = client.wait();
         delivery.unwrap();
 
         let mut expected = message.as_bytes().to_vec();
