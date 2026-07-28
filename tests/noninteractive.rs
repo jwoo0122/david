@@ -210,7 +210,7 @@ fn environment_agent_overrides_another_configured_default() {
 
 #[cfg(unix)]
 #[test]
-fn noninteractive_run_uses_default_agent_and_literal_runtime_argv_without_attach() {
+fn noninteractive_run_prepares_default_agent_with_literal_runtime_argv_without_starting() {
     if !tmux_available() {
         return;
     }
@@ -256,16 +256,20 @@ fn noninteractive_run_uses_default_agent_and_literal_runtime_argv_without_attach
     assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
     let target = managed_feature(home.path());
     assert!(target.is_dir());
-    for _ in 0..100 {
-        if output_file.is_file() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(
-        fs::read_to_string(&output_file).unwrap(),
-        "configured\n--model\ngpt 5.6\n$()\n"
-    );
+    thread::sleep(Duration::from_millis(100));
+    assert!(!output_file.exists());
+
+    let state_dir = home.path().join(".local/state/david/sessions");
+    let state = fs::read_to_string(
+        fs::read_dir(state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("state"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(state.contains("agent_command_hex="));
+    assert!(state.contains("agent_args_hex="));
 
     let cleanup = run_david(
         &server,
