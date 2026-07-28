@@ -1,5 +1,5 @@
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{engine::CompletionCandidate, CompleteEnv};
+use clap_complete::{CompleteEnv, engine::CompletionCandidate};
 use david::{App, DavidPaths, Git, Result, RunOptions, TmuxBackend, ToolError};
 use std::{env, io, io::IsTerminal};
 
@@ -87,10 +87,16 @@ enum Command {
     ///
     /// Both `david remove <name> --force` and `david remove --force <name>` are supported.
     Remove {
-        #[arg(add = clap_complete::ArgValueCompleter::new(worktree_completions))]
-        name: String,
+        #[arg(add = clap_complete::ArgValueCompleter::new(worktree_completions), required = true)]
+        names: Vec<String>,
         /// Discard uncommitted worktree changes; without it, dirty worktrees are rejected. It
         /// does not control branch deletion.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove every managed worktree for the current repository.
+    Cleanup {
+        /// Discard uncommitted worktree changes; without it, dirty worktrees are rejected.
         #[arg(long)]
         force: bool,
     },
@@ -185,7 +191,8 @@ fn run() -> Result<()> {
                     let mut output = stdout.lock();
                     app.path(&cwd, &name, zero, &mut output)
                 }
-                Command::Remove { name, force } => app.remove(&cwd, &name, force),
+                Command::Remove { names, force } => app.remove_many(&cwd, &names, force),
+                Command::Cleanup { force } => app.cleanup(&cwd, force),
                 Command::Setup => unreachable!(),
                 Command::Migrate { .. } => unreachable!(),
             }
@@ -216,11 +223,23 @@ mod tests {
             assert!(matches!(
                 cli.command,
                 Command::Remove {
-                    name,
+                    names,
                     force: true
-                } if name == "feature-login"
+                } if names == ["feature-login"]
             ));
         }
+    }
+
+    #[test]
+    fn remove_cli_accepts_multiple_names_and_cleanup_force() {
+        let cli = Cli::try_parse_from(["david", "remove", "first", "second", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Remove { names, force: true } if names == ["first", "second"]
+        ));
+
+        let cli = Cli::try_parse_from(["david", "cleanup", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Cleanup { force: true }));
     }
 
     #[test]

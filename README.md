@@ -167,9 +167,13 @@ Removal terminates its managed session, removes the worktree, and deletes the pa
 
 ```sh
 david remove feature-login
+# Remove several worktrees, continuing past individual failures:
+david remove feature-login feature-api
+# Remove every managed worktree for the current repository:
+david cleanup
 ```
 
-A dirty worktree is rejected unless `--force` is supplied. Branch deletion does not require a merge, so branch-only commits may be lost. `--force` applies to uncommitted worktree changes, not branch deletion.
+Both `remove` and `cleanup` attempt every selected worktree and report any failures together. A dirty worktree is rejected unless `--force` is supplied. Branch deletion does not require a merge, so branch-only commits may be lost. `--force` applies to uncommitted worktree changes, not branch deletion.
 
 ### Edit a worktree
 

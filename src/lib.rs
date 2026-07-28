@@ -1,7 +1,7 @@
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
@@ -1035,6 +1035,25 @@ pub fn parse_worktree_list(input: &str) -> Vec<Worktree> {
     }
     finish(&mut current);
     worktrees
+}
+
+fn interactive_worktree_label(entry: &ManagedWorktree, colored: bool) -> String {
+    let label = format!(
+        "{} ({}) [{} · {}]",
+        entry.name,
+        entry.branch,
+        entry.agent,
+        entry.session.as_str()
+    );
+    if !colored {
+        return label;
+    }
+    let color = match entry.session {
+        SessionStatus::Active => "\x1b[32m",
+        SessionStatus::Unknown => "\x1b[33m",
+        SessionStatus::Inactive => "\x1b[90m",
+    };
+    format!("{color}{label}\x1b[0m")
 }
 
 fn write_porcelain_list<W: Write>(
@@ -2503,15 +2522,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         }
         let labels: Vec<String> = entries
             .iter()
-            .map(|entry| {
-                format!(
-                    "{} ({}) [{} · {}]",
-                    entry.name,
-                    entry.branch,
-                    entry.agent,
-                    entry.session.as_str()
-                )
-            })
+            .map(|entry| interactive_worktree_label(entry, true))
             .chain(std::iter::once("New worktree...".to_owned()))
             .collect();
         let selection = Select::with_theme(&ColorfulTheme::default())
@@ -2672,6 +2683,45 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
         } else {
             Ok(("-".to_owned(), SessionStatus::Inactive))
         }
+    }
+
+    pub fn remove_many(&self, cwd: &Path, names: &[String], force: bool) -> Result<()> {
+        let root = self.git.repository_root(cwd)?;
+        let repo_id = self.git.repository_id(&root)?;
+        let managed_base = canonicalize_with_missing(&self.paths.repository_worktrees(&repo_id))?;
+        let operation_root = self
+            .git
+            .worktrees(&root)?
+            .into_iter()
+            .find(|worktree| {
+                canonicalize_with_missing(&worktree.path)
+                    .map(|path| !path.starts_with(&managed_base))
+                    .unwrap_or(false)
+            })
+            .map(|worktree| worktree.path)
+            .unwrap_or(root);
+
+        let mut seen = BTreeSet::new();
+        let mut failures = Vec::new();
+        for name in names.iter().filter(|name| seen.insert((*name).clone())) {
+            if let Err(error) = self.remove(&operation_root, name, force) {
+                failures.push(format!("{name}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ToolError::Message(format!(
+                "failed to remove {} worktree(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    pub fn cleanup(&self, cwd: &Path, force: bool) -> Result<()> {
+        let names = self.paths.worktree_names(cwd)?;
+        self.remove_many(cwd, &names, force)
     }
 
     pub fn remove(&self, cwd: &Path, name: &str, force: bool) -> Result<()> {
@@ -4787,6 +4837,68 @@ mod tests {
         assert!(!target.exists());
         assert!(!state_path.exists());
         assert_eq!(sessions.state.borrow().killed, vec![session]);
+    }
+
+    #[test]
+    fn interactive_worktree_labels_match_list_status_colors() {
+        let entry = |session| ManagedWorktree {
+            name: "feature".to_owned(),
+            branch: "feature".to_owned(),
+            agent: "test".to_owned(),
+            session,
+            path: PathBuf::from("/tmp/feature"),
+        };
+
+        assert!(
+            interactive_worktree_label(&entry(SessionStatus::Active), true).starts_with("\x1b[32m")
+        );
+        assert!(
+            interactive_worktree_label(&entry(SessionStatus::Inactive), true)
+                .starts_with("\x1b[90m")
+        );
+        assert!(
+            interactive_worktree_label(&entry(SessionStatus::Unknown), true)
+                .starts_with("\x1b[33m")
+        );
+        assert_eq!(
+            interactive_worktree_label(&entry(SessionStatus::Active), false),
+            "feature (feature) [test · active]"
+        );
+    }
+
+    #[test]
+    fn remove_many_continues_after_failures_and_cleanup_removes_all_managed_worktrees() {
+        let repo = init_repo();
+        let home = tempfile::tempdir().unwrap();
+        let paths = configured_paths(home.path());
+        let sessions = FakeSessions::default();
+        let app = test_app(paths.clone(), sessions);
+
+        app.run(repo.path(), "dirty").unwrap();
+        app.run(repo.path(), "clean").unwrap();
+        let repo_id = Git::default().repository_id(repo.path()).unwrap();
+        fs::write(
+            paths.worktree_path(&repo_id, "dirty").join("change"),
+            "dirty",
+        )
+        .unwrap();
+
+        let error = app
+            .remove_many(
+                repo.path(),
+                &["dirty".to_owned(), "clean".to_owned()],
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("dirty"));
+        assert!(paths.worktree_path(&repo_id, "dirty").exists());
+        assert!(!paths.worktree_path(&repo_id, "clean").exists());
+
+        app.run(repo.path(), "second").unwrap();
+        app.cleanup(repo.path(), true).unwrap();
+        assert!(app.paths.worktree_names(repo.path()).unwrap().is_empty());
+        assert!(!branch_exists(repo.path(), "dirty"));
+        assert!(!branch_exists(repo.path(), "second"));
     }
 
     #[test]
