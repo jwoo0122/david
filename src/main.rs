@@ -1,6 +1,6 @@
-use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{engine::CompletionCandidate, CompleteEnv};
-use david::{App, DavidPaths, Git, Result, RunOptions, TmuxBackend, ToolError};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{CompleteEnv, engine::CompletionCandidate};
+use david::{App, Backend, DavidPaths, Git, Result, RunOptions, SessionBackendKind, ToolError};
 use std::{env, io, io::IsTerminal};
 
 #[derive(Debug, Parser)]
@@ -35,6 +35,9 @@ enum Command {
         /// Create or reuse the session without attaching to it.
         #[arg(short = 'd', long)]
         detach: bool,
+        /// Execution backend (direct foreground execution or legacy tmux sessions).
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
         /// Prohibit all interactive selection and terminal attachment.
         #[arg(long)]
         no_interactive: bool,
@@ -96,6 +99,21 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BackendArg {
+    Direct,
+    Tmux,
+}
+
+impl From<BackendArg> for SessionBackendKind {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Direct => Self::Direct,
+            BackendArg::Tmux => Self::Tmux,
+        }
+    }
+}
+
 fn worktree_completions(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let Ok(paths) = DavidPaths::from_env() else {
         return Vec::new();
@@ -134,15 +152,30 @@ fn run() -> Result<()> {
         }
         command => {
             let cwd = env::current_dir()?;
-            let app = App::new(paths, TmuxBackend::default());
+            let configured_backend = paths.session_backend()?;
+            let command_backend = match &command {
+                Command::Run { backend, .. } => {
+                    backend.map(Into::into).unwrap_or(configured_backend)
+                }
+                Command::Attach { .. } | Command::Prompt { .. } => SessionBackendKind::Tmux,
+                _ => configured_backend,
+            };
+            let app = App::new(paths, Backend::from_kind(command_backend));
             match command {
                 Command::Run {
                     name,
                     agent,
                     detach,
+                    backend: _,
                     no_interactive,
                     agent_args,
                 } => {
+                    if detach && command_backend == SessionBackendKind::Direct {
+                        return Err(ToolError::Message(
+                            "--detach is only available with the tmux backend; use --backend tmux"
+                                .to_owned(),
+                        ));
+                    }
                     let interactive = terminal_interaction_allowed(
                         no_interactive,
                         io::stdin().is_terminal(),
@@ -272,6 +305,7 @@ mod tests {
                 detach,
                 no_interactive,
                 agent_args,
+                backend: _,
             } => {
                 assert_eq!(name.as_deref(), Some("feature-login"));
                 assert_eq!(agent.as_deref(), Some("codex"));
