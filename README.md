@@ -4,11 +4,11 @@
 
 <h1 align="center">David</h1>
 
-`david` creates Git worktrees in a user-level directory and runs configured agents in persistent tmux sessions.
+`david` creates Git worktrees in a user-level directory and runs configured agents inside them. Agents run directly in the current terminal by default, making David suitable for terminal workspace managers such as cmux. The previous persistent tmux workflow remains available as a legacy backend.
 
 ## Install
 
-Supported platforms are macOS and Linux. Install one of the following:
+Supported platforms are macOS and Linux.
 
 ### Homebrew
 
@@ -16,25 +16,23 @@ Supported platforms are macOS and Linux. Install one of the following:
 brew install jwoo0122/tap/david
 ```
 
-This installs a prebuilt binary. Git and tmux 3.2 or newer are also required.
-
 ### Cargo
 
 ```sh
 cargo install david
 ```
 
-Cargo installation additionally requires Rust and Cargo.
+Git is required. tmux 3.2 or newer is required only for the legacy `--tmux`, `--detach`, `attach`, and `prompt` workflows.
 
 ## Configuration
 
-Configuration, worktrees, and session state follow the XDG Base Directory layout:
+Configuration, worktrees, and legacy session state follow the XDG Base Directory layout:
 
 | Data | Path |
 | --- | --- |
 | Configuration | `$XDG_CONFIG_HOME/david/config.toml` or `~/.config/david/config.toml` |
 | Worktrees | `$XDG_DATA_HOME/david/worktrees/<repo-id>/<worktree>` or `~/.local/share/david/worktrees/<repo-id>/<worktree>` |
-| Session state | `$XDG_STATE_HOME/david/sessions/` or `~/.local/state/david/sessions/` |
+| Legacy session state | `$XDG_STATE_HOME/david/sessions/` or `~/.local/state/david/sessions/` |
 
 Only absolute XDG paths are used; relative values fall back to the paths above.
 
@@ -82,7 +80,16 @@ Run from a directory inside the source Git repository:
 david run feature-login
 ```
 
-When the worktree does not exist, `david` creates it from the current `HEAD`, on a same-named branch, under the configured data directory. Uncommitted changes in the source repository do not block creation and stay in the source repository. Existing worktrees and their live managed sessions are reused.
+When the worktree does not exist, David creates it from the current `HEAD`, on a same-named branch, under the configured data directory. Uncommitted changes in the source repository do not block creation and stay in the source repository. Existing worktrees are reused.
+
+By default, David replaces itself with the selected agent process in the current terminal. The terminal or workspace manager therefore owns the process lifecycle, signals, scrollback, and notifications:
+
+```text
+cmux workspace
+└── terminal
+    └── david run feature-login
+        └── codex
+```
 
 Agent selection, in order:
 
@@ -92,10 +99,10 @@ Agent selection, in order:
 4. The sole configured agent
 5. An interactive picker, when terminal interaction is available
 
-A live session is reused before agent selection. Without a worktree name, `run` opens an interactive picker when possible; non-interactive runs require a name. Use `--no-interactive` to disable terminal interaction and `--detach`/`-d` to create or reuse a session without attaching:
+Without a worktree name, `run` opens an interactive picker when possible; non-interactive runs require a name. Use `--no-interactive` to disable selection prompts:
 
 ```sh
-david run -a codex -d feature-login
+david run -a codex --no-interactive feature-login
 DAVID_AGENT=claude david run feature-login -- --model sonnet
 ```
 
@@ -104,6 +111,38 @@ Arguments after `--` are appended to the configured command as literal argv valu
 ```sh
 david run -a codex feature-login -- --model gpt-5.6
 ```
+
+Direct agents are not persistent David sessions. David cannot reattach to them, inject prompts into them, or terminate them during worktree removal. Stop the agent in its owning terminal before running `david remove`.
+
+### Legacy tmux sessions
+
+Use `--tmux` to retain the previous persistent and attachable workflow:
+
+```sh
+david run --tmux feature-login
+```
+
+`--detach` implies the legacy tmux backend, preserving the existing detached-session command:
+
+```sh
+david run --detach feature-login
+```
+
+Each legacy worktree has at most one managed agent session. David uses a dedicated tmux server, does not load `~/.tmux.conf`, and explicitly configures status-line styling and interaction options. Press `Ctrl-g` to choose among live sessions for the current project. Detach with `Ctrl-]`; `Ctrl-b`, then `d`, remains available as a fallback.
+
+Attach only to an existing legacy managed session:
+
+```sh
+david attach feature-login
+```
+
+Send a prompt without attaching or starting a legacy session:
+
+```sh
+david prompt feature-login "Review the failing tests"
+```
+
+The message is delivered exactly as received, including Unicode and newlines. Quote it for your shell; shell parsing happens before David receives it.
 
 ### Shell completion
 
@@ -127,25 +166,9 @@ $env:COMPLETE = "powershell"; david | Out-String | Invoke-Expression; Remove-Ite
 
 The same completion is available for `david run`, `david remove`, and `david edit`.
 
-### Attach and send prompts
-
-Attach only to an existing managed session:
-
-```sh
-david attach feature-login
-```
-
-Send a prompt without attaching or starting a session:
-
-```sh
-david prompt feature-login "Review the failing tests"
-```
-
-The message is delivered exactly as received, including Unicode and newlines. Quote it for your shell; shell parsing happens before `david` receives it.
-
 ### Inspect managed worktrees
 
-List worktrees and session status:
+List worktrees and legacy tmux session status:
 
 ```sh
 david list
@@ -163,7 +186,7 @@ david path -0 feature-login
 
 ### Remove a worktree
 
-Removal terminates its managed session, removes the worktree, and deletes the paired local branch:
+Removal terminates a legacy managed session when present, removes the worktree, and deletes the paired local branch:
 
 ```sh
 david remove feature-login
@@ -180,9 +203,5 @@ EDITOR="code --wait" david edit feature-login
 ```
 
 `EDITOR` is parsed as shell-style arguments and executed directly, without an intermediate shell. David appends the absolute worktree directory as the final argument and waits for the editor to exit.
-
-### tmux sessions
-
-Each worktree has at most one managed agent session. `david` uses a dedicated tmux server, does not load `~/.tmux.conf`, and explicitly configures status-line styling and interaction options. Press `Ctrl-g` to choose among live sessions for the current project. Detach with `Ctrl-]`; `Ctrl-b`, then `d`, remains available as a fallback.
 
 Commands return `0` on success, `1` for runtime errors, and `2` for invalid command lines or unavailable agent selection.
