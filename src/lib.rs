@@ -21,6 +21,9 @@ use std::{
 };
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 pub type Result<T> = std::result::Result<T, ToolError>;
 
 #[derive(Debug, Error)]
@@ -183,18 +186,12 @@ impl DavidPaths {
             },
         ];
 
-        let pending: Vec<&MigrationItem> = items
-            .iter()
-            .filter(|item| item.src.exists())
-            .collect();
+        let pending: Vec<&MigrationItem> = items.iter().filter(|item| item.src.exists()).collect();
 
         if pending.is_empty() {
             eprintln!("No legacy David data found in ~/.david; nothing to migrate.");
             if dir_is_empty(&legacy_root) {
-                eprintln!(
-                    "Removing empty legacy directory: {}",
-                    legacy_root.display()
-                );
+                eprintln!("Removing empty legacy directory: {}", legacy_root.display());
                 if !dry_run {
                     fs::remove_dir(&legacy_root)?;
                 }
@@ -278,10 +275,7 @@ impl DavidPaths {
         }
 
         if dir_is_empty(&legacy_root) {
-            eprintln!(
-                "Removing empty legacy directory: {}",
-                legacy_root.display()
-            );
+            eprintln!("Removing empty legacy directory: {}", legacy_root.display());
             fs::remove_dir(&legacy_root)?;
         } else {
             eprintln!(
@@ -423,8 +417,18 @@ pub struct Agent {
     pub args: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionBackendKind {
+    #[default]
+    Direct,
+    Tmux,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
+    #[serde(default)]
+    pub session_backend: SessionBackendKind,
     #[serde(default)]
     pub default_agent: Option<String>,
     #[serde(default)]
@@ -567,6 +571,12 @@ impl Config {
     }
 }
 
+impl DavidPaths {
+    pub fn session_backend(&self) -> Result<SessionBackendKind> {
+        Ok(Config::load_or_default(&self.config)?.session_backend)
+    }
+}
+
 trait SetupPrompter {
     fn collect(&self, config: Config) -> Result<Config>;
 }
@@ -576,6 +586,19 @@ struct TerminalSetupPrompter;
 
 impl SetupPrompter for TerminalSetupPrompter {
     fn collect(&self, mut config: Config) -> Result<Config> {
+        let backends = ["direct (recommended)", "tmux (legacy persistent sessions)"];
+        let default = usize::from(config.session_backend == SessionBackendKind::Tmux);
+        let selected = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Session backend")
+            .items(backends)
+            .default(default)
+            .interact()
+            .map_err(io::Error::from)?;
+        config.session_backend = if selected == 0 {
+            SessionBackendKind::Direct
+        } else {
+            SessionBackendKind::Tmux
+        };
         print_agents(&config);
         loop {
             let name = prompt_text("Agent name (Enter to finish)", true)?;
@@ -926,10 +949,7 @@ impl Git {
     fn move_worktree(&self, worktree_path: &Path, new_path: &Path) -> Result<()> {
         let common_dir = self.common_git_dir(worktree_path)?;
         let repo_root = if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
-            common_dir
-                .parent()
-                .unwrap_or(&common_dir)
-                .to_path_buf()
+            common_dir.parent().unwrap_or(&common_dir).to_path_buf()
         } else {
             common_dir.clone()
         };
@@ -1155,6 +1175,9 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
 }
 
 pub trait SessionBackend {
+    fn is_persistent(&self) -> bool {
+        true
+    }
     fn ensure_available(&self) -> Result<()>;
     fn has_session(&self, name: &str) -> Result<bool>;
     fn create_session(&self, name: &str, cwd: &Path, agent: &Agent) -> Result<()>;
@@ -1184,11 +1207,7 @@ pub trait SessionBackend {
     fn configure_session_options(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
         Ok(())
     }
-    fn configure_session_affordances(
-        &self,
-        name: &str,
-        metadata: &SessionMetadata,
-    ) -> Result<()> {
+    fn configure_session_affordances(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
         self.configure_session_options(name, metadata)
     }
     fn configure_session(&self, _name: &str, _metadata: &SessionMetadata) -> Result<()> {
@@ -1219,6 +1238,148 @@ pub trait SessionBackend {
         self.deliver_prompt(name, message)
     }
     fn kill_session(&self, name: &str) -> Result<()>;
+}
+
+/// Foreground backend: the agent replaces the david process and the caller owns
+/// its lifetime. It intentionally never reports or terminates a session.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DirectBackend;
+
+impl SessionBackend for DirectBackend {
+    fn is_persistent(&self) -> bool {
+        false
+    }
+    fn ensure_available(&self) -> Result<()> {
+        Ok(())
+    }
+    fn has_session(&self, _name: &str) -> Result<bool> {
+        Ok(false)
+    }
+    fn create_session(&self, _name: &str, cwd: &Path, agent: &Agent) -> Result<()> {
+        let mut command = Command::new(&agent.command);
+        command.current_dir(cwd).args(&agent.args);
+        #[cfg(unix)]
+        {
+            let error = command.exec();
+            Err(ToolError::Io(error))
+        }
+        #[cfg(not(unix))]
+        {
+            let status = command.status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(ToolError::Command {
+                    program: agent.command.clone(),
+                    detail: status.to_string(),
+                })
+            }
+        }
+    }
+    fn attach(&self, _name: &str) -> Result<()> {
+        Err(ToolError::Message(
+            "attach requires a running tmux-managed session; use --backend tmux when starting it"
+                .to_owned(),
+        ))
+    }
+    fn deliver_prompt(&self, _name: &str, _message: &str) -> Result<()> {
+        Err(ToolError::Message(
+            "prompt requires a running tmux-managed session; use --backend tmux when starting it"
+                .to_owned(),
+        ))
+    }
+    fn kill_session(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Backend {
+    Direct(DirectBackend),
+    Tmux(TmuxBackend),
+}
+
+impl Backend {
+    pub fn from_kind(kind: SessionBackendKind) -> Self {
+        match kind {
+            SessionBackendKind::Direct => Self::Direct(DirectBackend),
+            SessionBackendKind::Tmux => Self::Tmux(TmuxBackend::default()),
+        }
+    }
+}
+
+macro_rules! backend_call {
+    ($self:ident, $method:ident ( $($arg:expr),* )) => {
+        match $self { Backend::Direct(value) => value.$method($($arg),*), Backend::Tmux(value) => value.$method($($arg),*) }
+    };
+}
+
+impl SessionBackend for Backend {
+    fn is_persistent(&self) -> bool {
+        match self {
+            Backend::Direct(value) => value.is_persistent(),
+            Backend::Tmux(value) => value.is_persistent(),
+        }
+    }
+    fn ensure_available(&self) -> Result<()> {
+        backend_call!(self, ensure_available())
+    }
+    fn has_session(&self, name: &str) -> Result<bool> {
+        backend_call!(self, has_session(name))
+    }
+    fn create_session(&self, name: &str, cwd: &Path, agent: &Agent) -> Result<()> {
+        backend_call!(self, create_session(name, cwd, agent))
+    }
+    fn create_session_with_pane(
+        &self,
+        name: &str,
+        cwd: &Path,
+        agent: &Agent,
+    ) -> Result<Option<String>> {
+        backend_call!(self, create_session_with_pane(name, cwd, agent))
+    }
+    fn agent_pane(&self, name: &str) -> Result<Option<String>> {
+        backend_call!(self, agent_pane(name))
+    }
+    fn pane_is_alive(&self, name: &str, pane: &str) -> Result<bool> {
+        backend_call!(self, pane_is_alive(name, pane))
+    }
+    fn configure_session_options(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+        backend_call!(self, configure_session_options(name, metadata))
+    }
+    fn configure_session_affordances(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+        backend_call!(self, configure_session_affordances(name, metadata))
+    }
+    fn configure_session(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+        backend_call!(self, configure_session(name, metadata))
+    }
+    fn validate_session_metadata(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
+        backend_call!(self, validate_session_metadata(name, metadata))
+    }
+    fn agent_started(&self, name: &str) -> Result<bool> {
+        backend_call!(self, agent_started(name))
+    }
+    fn reserve_agent_start(&self, name: &str) -> Result<bool> {
+        backend_call!(self, reserve_agent_start(name))
+    }
+    fn attach_with_agent(&self, name: &str, pane: &str, agent: &Agent) -> Result<()> {
+        backend_call!(self, attach_with_agent(name, pane, agent))
+    }
+    fn attach(&self, name: &str) -> Result<()> {
+        backend_call!(self, attach(name))
+    }
+    fn clear_session_affordances(&self, name: &str) -> Result<()> {
+        backend_call!(self, clear_session_affordances(name))
+    }
+    fn deliver_prompt(&self, name: &str, message: &str) -> Result<()> {
+        backend_call!(self, deliver_prompt(name, message))
+    }
+    fn deliver_prompt_to(&self, name: &str, message: &str, pane: Option<&str>) -> Result<()> {
+        backend_call!(self, deliver_prompt_to(name, message, pane))
+    }
+    fn kill_session(&self, name: &str) -> Result<()> {
+        backend_call!(self, kill_session(name))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1844,11 +2005,7 @@ impl SessionBackend for TmuxBackend {
         self.ensure_extended_key_features()
     }
 
-    fn configure_session_affordances(
-        &self,
-        name: &str,
-        metadata: &SessionMetadata,
-    ) -> Result<()> {
+    fn configure_session_affordances(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
         self.configure_session_options(name, metadata)?;
         self.configure_key_table(name)?;
         self.set_option(
@@ -2286,7 +2443,9 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             pane: None,
             launch_agent: Some(agent.clone()),
         };
-        write_session_state(&state_path, &state)?;
+        if self.sessions.is_persistent() {
+            write_session_state(&state_path, &state)?;
+        }
         let pane = match self
             .sessions
             .create_session_with_pane(&session, &target, &agent)
@@ -2524,12 +2683,7 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
             })
     }
 
-    pub fn list<W: Write>(
-        &self,
-        cwd: &Path,
-        colored: bool,
-        output: &mut W,
-    ) -> Result<()> {
+    pub fn list<W: Write>(&self, cwd: &Path, colored: bool, output: &mut W) -> Result<()> {
         let mut entries = self.managed_worktrees(cwd)?;
         entries.sort_by_key(|e| matches!(e.session, SessionStatus::Inactive));
 
@@ -2651,8 +2805,8 @@ impl<S: SessionBackend, P: AgentPicker> App<S, P> {
 
     pub fn edit(&self, cwd: &Path, name: &str) -> Result<()> {
         let path = self.managed_worktree_path(cwd, name)?;
-        let editor = env::var("EDITOR")
-            .map_err(|_| ToolError::Message("EDITOR is not set".to_owned()))?;
+        let editor =
+            env::var("EDITOR").map_err(|_| ToolError::Message("EDITOR is not set".to_owned()))?;
         let command = shell_words::split(&editor)
             .map_err(|error| ToolError::Message(format!("invalid EDITOR value: {error}")))?;
         let Some((program, args)) = command.split_first() else {
@@ -3202,9 +3356,9 @@ fn exact_session_target(session: &str) -> String {
 }
 
 fn repository_session_pattern(session: &str) -> Result<String> {
-    let (prefix, hash) = session.rsplit_once('-').ok_or_else(|| {
-        ToolError::Message(format!("invalid david tmux session name: {session}"))
-    })?;
+    let (prefix, hash) = session
+        .rsplit_once('-')
+        .ok_or_else(|| ToolError::Message(format!("invalid david tmux session name: {session}")))?;
     if prefix.is_empty()
         || !prefix
             .bytes()
@@ -3494,7 +3648,6 @@ fn supports_extended_keys(version: &str) -> bool {
     };
     major > 3 || major == 3 && minor >= 2
 }
-
 
 /// Returns a `terminal-features` entry that adds the `extkeys` feature
 /// for the given terminal type, if the terminal is known to support
@@ -3826,7 +3979,10 @@ mod tests {
         let sw = status.len().max("STATUS".len());
         format!(
             "{:<nw$}  {:<bw$}  {:<aw$}  {:<sw$}",
-            name, branch, agent, status,
+            name,
+            branch,
+            agent,
+            status,
             nw = nw,
             bw = bw,
             aw = aw,
@@ -3962,6 +4118,7 @@ mod tests {
     #[test]
     fn agent_resolution_uses_precedence_and_never_picks_for_an_unknown_name() {
         let config = Config {
+            session_backend: SessionBackendKind::Direct,
             default_agent: Some("default".to_owned()),
             agents: [
                 (
@@ -4014,6 +4171,7 @@ mod tests {
     #[test]
     fn agent_resolution_uses_the_sole_agent_or_picker_and_rejects_noninteractive_selection() {
         let sole = Config {
+            session_backend: SessionBackendKind::Direct,
             default_agent: None,
             agents: [(
                 "sole".to_owned(),
@@ -4033,6 +4191,7 @@ mod tests {
         assert_eq!(*picker.calls.borrow(), 0);
 
         let multiple = Config {
+            session_backend: SessionBackendKind::Direct,
             default_agent: None,
             agents: [
                 (
@@ -4189,6 +4348,7 @@ mod tests {
     #[test]
     fn rejects_nul_in_agent_configuration_and_session_state_values() {
         let config = |name: &str, agent: Agent| Config {
+            session_backend: SessionBackendKind::Direct,
             default_agent: None,
             agents: BTreeMap::from([(name.to_owned(), agent)]),
         };
@@ -4913,11 +5073,12 @@ mod tests {
 
         let mut output = Vec::new();
         app.list(repo.path(), false, &mut output).unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains(&row_prefix("feature/login", "feature/login", "test", "active"))
-        );
+        assert!(String::from_utf8(output).unwrap().contains(&row_prefix(
+            "feature/login",
+            "feature/login",
+            "test",
+            "active"
+        )));
 
         app.remove(repo.path(), name, true).unwrap();
         assert!(!target.exists());
@@ -5743,11 +5904,12 @@ mod tests {
 
         let mut output = Vec::new();
         app.list(repo.path(), false, &mut output).unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains(&row_prefix("feature", "(detached)", "-", "inactive"))
-        );
+        assert!(String::from_utf8(output).unwrap().contains(&row_prefix(
+            "feature",
+            "(detached)",
+            "-",
+            "inactive"
+        )));
 
         run_git(&target, &["switch", "-c", "other"]);
         let mut output = Vec::new();

@@ -132,7 +132,11 @@ fn run_david(server: &TmuxTestServer, home: &Path, repo: &Path, args: &[&str]) -
 fn write_config(home: &Path, content: &str) {
     let directory = home.join(".config").join("david");
     fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("config.toml"), content).unwrap();
+    fs::write(
+        directory.join("config.toml"),
+        format!("session_backend = \"tmux\"\n{content}"),
+    )
+    .unwrap();
 }
 
 fn managed_feature(home: &Path) -> PathBuf {

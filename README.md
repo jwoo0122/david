@@ -4,7 +4,7 @@
 
 <h1 align="center">David</h1>
 
-`david` creates Git worktrees in a user-level directory and runs configured agents in persistent tmux sessions.
+`david` creates Git worktrees in a user-level directory and runs configured agents directly in the current terminal. A legacy tmux backend remains available for persistent sessions.
 
 ## Install
 
@@ -16,7 +16,7 @@ Supported platforms are macOS and Linux. Install one of the following:
 brew install jwoo0122/tap/david
 ```
 
-This installs a prebuilt binary. Git and tmux 3.2 or newer are also required.
+This installs a prebuilt binary. Git is required. tmux 3.2 or newer is only required when using the optional tmux backend.
 
 ### Cargo
 
@@ -50,6 +50,7 @@ You can also edit `config.toml` directly:
 
 ```toml
 default_agent = "codex"
+session_backend = "direct" # default; use "tmux" for persistent sessions
 
 [agents.codex]
 command = "codex"
@@ -82,7 +83,9 @@ Run from a directory inside the source Git repository:
 david run feature-login
 ```
 
-When the worktree does not exist, `david` creates it from the current `HEAD`, on a same-named branch, under the configured data directory. Uncommitted changes in the source repository do not block creation and stay in the source repository. Existing worktrees and their live managed sessions are reused.
+When the worktree does not exist, `david` creates it from the current `HEAD`, on a same-named branch, under the configured data directory. Uncommitted changes in the source repository do not block creation and stay in the source repository.
+
+Direct foreground execution is the default. David changes to the worktree and replaces itself with the agent process, so the agent receives terminal signals directly and its exit status is returned unchanged. The calling terminal or orchestrator owns the process lifetime; stop processes that use a worktree before removing it. tmux is not checked or required in this mode.
 
 Agent selection, in order:
 
@@ -92,10 +95,10 @@ Agent selection, in order:
 4. The sole configured agent
 5. An interactive picker, when terminal interaction is available
 
-A live session is reused before agent selection. Without a worktree name, `run` opens an interactive picker when possible; non-interactive runs require a name. Use `--no-interactive` to disable terminal interaction and `--detach`/`-d` to create or reuse a session without attaching:
+Without a worktree name, `run` opens an interactive picker when possible; non-interactive runs require a name. Use `--no-interactive` to disable terminal interaction. Select the legacy tmux backend in configuration or per invocation when persistence or detaching is needed:
 
 ```sh
-david run -a codex -d feature-login
+david run --backend tmux -a codex -d feature-login
 DAVID_AGENT=claude david run feature-login -- --model sonnet
 ```
 
@@ -181,8 +184,8 @@ EDITOR="code --wait" david edit feature-login
 
 `EDITOR` is parsed as shell-style arguments and executed directly, without an intermediate shell. David appends the absolute worktree directory as the final argument and waits for the editor to exit.
 
-### tmux sessions
+### tmux sessions (legacy backend)
 
-Each worktree has at most one managed agent session. `david` uses a dedicated tmux server, does not load `~/.tmux.conf`, and explicitly configures status-line styling and interaction options. Press `Ctrl-g` to choose among live sessions for the current project. Detach with `Ctrl-]`; `Ctrl-b`, then `d`, remains available as a fallback.
+Set `session_backend = "tmux"` or pass `david run --backend tmux`. Each worktree has at most one managed agent session. A live session is reused before agent selection. `david` uses a dedicated tmux server, does not load `~/.tmux.conf`, and explicitly configures status-line styling and interaction options. Press `Ctrl-g` to choose among live sessions for the current project. Detach with `Ctrl-]`; `Ctrl-b`, then `d`, remains available as a fallback. `attach`, `prompt`, and `run --detach` require a tmux-managed session; direct mode rejects detaching with guidance to select tmux.
 
 Commands return `0` on success, `1` for runtime errors, and `2` for invalid command lines or unavailable agent selection.

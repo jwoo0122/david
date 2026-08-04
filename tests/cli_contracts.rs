@@ -150,6 +150,62 @@ fn fake_tmux_without_sessions() -> TempDir {
 }
 
 #[test]
+fn direct_is_default_and_preserves_exit_status_cwd_and_literal_arguments() {
+    let repo = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    let log = home.path().join("direct-agent");
+    let agent = home.path().join("agent.sh");
+    fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\npwd > '{}'\nprintf '%s\\n' \"$@\" >> '{}'\nexit 37\n",
+            log.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&agent, permissions).unwrap();
+    let config = home.path().join(".config/david");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("config.toml"),
+        format!(
+            "[agents.test]\ncommand = {:?}\nargs = [\"configured\"]\n",
+            agent.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let output = david(
+        home.path(),
+        repo.path(),
+        &["run", "feature", "--", "gpt 5.6", "$()"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(37));
+    let lines = fs::read_to_string(log).unwrap();
+    assert!(lines.lines().next().unwrap().ends_with("/feature"));
+    assert!(lines.ends_with("configured\ngpt 5.6\n$()\n"));
+}
+
+#[test]
+fn direct_backend_rejects_detach_with_an_actionable_error() {
+    let repo = init_repo();
+    let home = tempfile::tempdir().unwrap();
+    let output = david(
+        home.path(),
+        repo.path(),
+        &["run", "--detach", "feature"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--backend tmux"));
+    assert!(!home.path().join(".local/share/david/worktrees").exists());
+}
+
+#[test]
 fn dynamic_completion_registration_is_available_for_supported_shells() {
     let repo = init_repo();
     let home = tempfile::tempdir().unwrap();
@@ -174,10 +230,7 @@ fn list_human_bytes_and_empty_porcelain_output_are_stable() {
     let human = david(home.path(), repo.path(), &["list"], Some(tmux.path()));
     assert_eq!(human.status.code(), Some(0));
     assert!(human.stderr.is_empty());
-    assert_eq!(
-        human.stdout,
-        b"No managed worktrees.\n"
-    );
+    assert_eq!(human.stdout, b"No managed worktrees.\n");
 
     let porcelain = david(
         home.path(),
@@ -280,7 +333,10 @@ fn edit_runs_editor_with_shell_style_arguments_and_worktree_path() {
     assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
     assert!(output.stderr.is_empty());
     let expected = fs::canonicalize(target).unwrap();
-    assert_eq!(fs::read_to_string(log).unwrap(), format!("--wait\n{}\n", expected.display()));
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        format!("--wait\n{}\n", expected.display())
+    );
 }
 
 #[test]
@@ -514,7 +570,10 @@ fn migrate_dry_run_makes_no_changes() {
 
     let output = david(home.path(), home.path(), &["migrate", "--dry-run"], None);
     assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
-    assert!(legacy.join("config.toml").is_file(), "source should be untouched");
+    assert!(
+        legacy.join("config.toml").is_file(),
+        "source should be untouched"
+    );
     assert!(
         !home.path().join(".config/david/config.toml").is_file(),
         "destination should not be created"
@@ -545,7 +604,10 @@ fn migrate_detects_destination_conflicts() {
         String::from_utf8_lossy(&output.stderr).contains("conflict"),
         "should report conflict"
     );
-    assert!(legacy.join("config.toml").is_file(), "source should be untouched");
+    assert!(
+        legacy.join("config.toml").is_file(),
+        "source should be untouched"
+    );
 }
 
 #[test]
@@ -582,7 +644,10 @@ fn migrate_preserves_unknown_files_in_legacy_root() {
     let output = david(home.path(), home.path(), &["migrate"], None);
     assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
     assert!(legacy.exists(), "legacy dir should be preserved");
-    assert!(legacy.join("unknown.txt").is_file(), "unknown file should be preserved");
+    assert!(
+        legacy.join("unknown.txt").is_file(),
+        "unknown file should be preserved"
+    );
     assert!(home.path().join(".config/david/config.toml").is_file());
 }
 
@@ -640,7 +705,11 @@ fn migrate_resumes_after_partial_success() {
     // Second migration: only sessions should migrate
     let second = david(home.path(), home.path(), &["migrate"], None);
     assert_eq!(second.status.code(), Some(0), "stderr: {:?}", second.stderr);
-    assert!(home.path().join(".local/state/david/sessions/test.state").is_file());
+    assert!(
+        home.path()
+            .join(".local/state/david/sessions/test.state")
+            .is_file()
+    );
     assert!(!legacy.exists(), "legacy should be cleaned up");
 }
 
