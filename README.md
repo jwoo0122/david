@@ -1,3 +1,8 @@
+This project is archived. I use [gwq](https://github.com/d-kuro/gwq) now.
+
+
+---
+
 <p align="center">
   <img src="./icon.png" alt="david" width="80">
 </p>
