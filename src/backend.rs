@@ -254,14 +254,20 @@ pub(crate) fn direct_agent_is_resolvable(
 
 fn session_state_directories() -> Vec<PathBuf> {
     let mut directories = Vec::new();
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        let state_root = env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".local/state"));
+    let xdg_state_root = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+
+    if let Some(state_root) = &xdg_state_root {
         directories.push(state_root.join("david/sessions"));
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        if xdg_state_root.is_none() {
+            directories.push(home.join(".local/state/david/sessions"));
+        }
         directories.push(home.join(".david/sessions"));
     }
+
     directories.sort();
     directories.dedup();
     directories
