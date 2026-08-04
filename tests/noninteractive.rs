@@ -2,8 +2,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    thread,
-    time::Duration,
 };
 use tempfile::TempDir;
 
@@ -180,7 +178,7 @@ fn environment_agent_overrides_another_configured_default() {
     let home = tempfile::tempdir().unwrap();
     write_config(
         home.path(),
-        "default_agent = \"other\"\n\n[agents.codex]\ncommand = \"sleep\"\nargs = [\"30\"]\n\n[agents.other]\ncommand = \"missing-agent\"\n",
+        "default_agent = \"other\"\n\n[agents.codex]\ncommand = \"true\"\n\n[agents.other]\ncommand = \"missing-agent\"\n",
     );
     let server = TmuxTestServer::new(home.path());
 
@@ -210,7 +208,7 @@ fn environment_agent_overrides_another_configured_default() {
 
 #[cfg(unix)]
 #[test]
-fn noninteractive_run_prepares_default_agent_with_literal_runtime_argv_without_starting() {
+fn noninteractive_run_executes_default_agent_with_literal_runtime_argv() {
     if !tmux_available() {
         return;
     }
@@ -220,7 +218,7 @@ fn noninteractive_run_prepares_default_agent_with_literal_runtime_argv_without_s
     let output_file = home.path().join("argv");
     let script = home.path().join("agent.sh");
     let script_content = format!(
-        "#!/bin/sh\n: > '{}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nsleep 30\n",
+        "#!/bin/sh\n: > '{}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\n",
         output_file.display(),
         output_file.display()
     );
@@ -256,20 +254,18 @@ fn noninteractive_run_prepares_default_agent_with_literal_runtime_argv_without_s
     assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
     let target = managed_feature(home.path());
     assert!(target.is_dir());
-    thread::sleep(Duration::from_millis(100));
-    assert!(!output_file.exists());
+    assert_eq!(
+        fs::read_to_string(&output_file).unwrap(),
+        "configured\n--model\ngpt 5.6\n$()\n"
+    );
 
     let state_dir = home.path().join(".local/state/david/sessions");
-    let state = fs::read_to_string(
-        fs::read_dir(state_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("state"))
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(state.contains("agent_command_hex="));
-    assert!(state.contains("agent_args_hex="));
+    let state_files = fs::read_dir(state_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("state"))
+        .collect::<Vec<_>>();
+    assert!(state_files.is_empty());
 
     let cleanup = run_david(
         &server,
