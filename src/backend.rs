@@ -1,6 +1,4 @@
-use david::{
-    Agent, DavidPaths, Result, SessionBackend, SessionMetadata, TmuxBackend, ToolError,
-};
+use david::{Agent, DavidPaths, Result, SessionBackend, SessionMetadata, TmuxBackend, ToolError};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -87,11 +85,7 @@ impl SessionBackend for DirectBackend {
         }
     }
 
-    fn configure_session_affordances(
-        &self,
-        name: &str,
-        metadata: &SessionMetadata,
-    ) -> Result<()> {
+    fn configure_session_affordances(&self, name: &str, metadata: &SessionMetadata) -> Result<()> {
         if self.is_direct(name) {
             Ok(())
         } else {
@@ -246,8 +240,15 @@ pub(crate) fn direct_agent_is_resolvable(
     if explicit.is_some() || env::var("DAVID_AGENT").is_ok_and(|agent| !agent.is_empty()) {
         return Ok(true);
     }
-    let content = fs::read_to_string(paths.config_path())?;
-    let config: AgentSelectionConfig = toml::from_str(&content)?;
+    let content = match fs::read_to_string(paths.config_path()) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(ToolError::Io(error)),
+    };
+    let config: AgentSelectionConfig = match toml::from_str(&content) {
+        Ok(config) => config,
+        Err(_) => return Ok(true),
+    };
     Ok(config.default_agent.is_some() || config.agents.len() == 1)
 }
 
