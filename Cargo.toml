@@ -2,7 +2,7 @@
 name = "david"
 version = "1.10.1"
 edition = "2024"
-description = "Manage Git worktrees and attachable agent sessions"
+description = "Manage Git worktrees and run coding agents"
 homepage = "https://github.com/jwoo0122/david"
 license = "MIT"
 repository = "https://github.com/jwoo0122/david"
