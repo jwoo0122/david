@@ -5,11 +5,7 @@ use david::{App, DavidPaths, Git, Result, RunOptions, SessionBackend, TmuxBacken
 mod backend;
 
 use backend::{DirectBackend, direct_agent_is_resolvable};
-use std::{
-    env, io,
-    io::IsTerminal,
-    path::Path,
-};
+use std::{env, io, io::IsTerminal, path::Path};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -175,6 +171,11 @@ fn run() -> Result<()> {
                         io::stdin().is_terminal(),
                         io::stderr().is_terminal(),
                     );
+                    if name.is_none() && !selection_interactive {
+                        return Err(ToolError::Message(
+                            "non-interactive run requires a worktree name".to_owned(),
+                        ));
+                    }
                     if tmux || detach {
                         let options = RunOptions {
                             agent,
@@ -216,8 +217,9 @@ fn run() -> Result<()> {
                 Command::Attach { name } => {
                     App::new(paths, TmuxBackend::default()).attach(&cwd, &name)
                 }
-                Command::Prompt { worktree, message } => App::new(paths, TmuxBackend::default())
-                    .prompt(&cwd, &worktree, &message),
+                Command::Prompt { worktree, message } => {
+                    App::new(paths, TmuxBackend::default()).prompt(&cwd, &worktree, &message)
+                }
                 Command::List { porcelain, zero } => {
                     let app = App::new(paths, DirectBackend::default());
                     let stdout = io::stdout();
@@ -232,8 +234,7 @@ fn run() -> Result<()> {
                 Command::Path { name, zero } => {
                     let stdout = io::stdout();
                     let mut output = stdout.lock();
-                    App::new(paths, DirectBackend::default())
-                        .path(&cwd, &name, zero, &mut output)
+                    App::new(paths, DirectBackend::default()).path(&cwd, &name, zero, &mut output)
                 }
                 Command::Remove { name, force } => {
                     App::new(paths, DirectBackend::default()).remove(&cwd, &name, force)
@@ -337,15 +338,9 @@ mod tests {
 
     #[test]
     fn run_cli_supports_explicit_legacy_tmux_mode() {
-        let cli = Cli::try_parse_from([
-            "david",
-            "run",
-            "--tmux",
-            "-a",
-            "claude",
-            "feature-login",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["david", "run", "--tmux", "-a", "claude", "feature-login"])
+                .unwrap();
 
         assert!(matches!(
             cli.command,
