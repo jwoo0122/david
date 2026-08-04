@@ -1,13 +1,21 @@
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{engine::CompletionCandidate, CompleteEnv};
-use david::{App, DavidPaths, Git, Result, RunOptions, TmuxBackend, ToolError};
-use std::{env, io, io::IsTerminal};
+use clap_complete::{CompleteEnv, engine::CompletionCandidate};
+use david::{App, DavidPaths, Git, Result, RunOptions, SessionBackend, TmuxBackend, ToolError};
+
+mod backend;
+
+use backend::{DirectBackend, direct_agent_is_resolvable};
+use std::{
+    env, io,
+    io::IsTerminal,
+    path::Path,
+};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "david",
     version,
-    about = "Manage Git worktrees and agent sessions"
+    about = "Manage Git worktrees and run coding agents"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,7 +32,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Create or reuse a worktree and attach to its agent session.
+    /// Create or reuse a worktree and run its agent in the current terminal.
     Run {
         /// Name of the managed worktree. If omitted in an interactive terminal, a picker is shown.
         #[arg(add = clap_complete::ArgValueCompleter::new(worktree_completions))]
@@ -32,10 +40,13 @@ enum Command {
         /// Select a configured agent without opening the picker.
         #[arg(short = 'a', long)]
         agent: Option<String>,
-        /// Create or reuse the session without attaching to it.
+        /// Use the legacy persistent tmux session backend.
+        #[arg(long)]
+        tmux: bool,
+        /// Use the legacy tmux backend and create or reuse the session without attaching to it.
         #[arg(short = 'd', long)]
         detach: bool,
-        /// Prohibit all interactive selection and terminal attachment.
+        /// Prohibit interactive selection. In tmux mode, also prohibit attachment.
         #[arg(long)]
         no_interactive: bool,
         /// Arguments appended to the configured agent command.
@@ -48,9 +59,9 @@ enum Command {
         #[arg(add = clap_complete::ArgValueCompleter::new(worktree_completions))]
         worktree: String,
     },
-    /// Attach to an existing managed agent session.
+    /// Attach to an existing legacy tmux agent session.
     Attach { name: String },
-    /// Deliver a prompt to an existing managed agent session.
+    /// Deliver a prompt to an existing legacy tmux agent session.
     Prompt {
         /// Name of the existing managed worktree.
         worktree: String,
@@ -58,7 +69,7 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         message: String,
     },
-    /// List managed worktrees and their active agent sessions.
+    /// List managed worktrees and any active legacy tmux sessions.
     List {
         /// Emit stable machine-readable records instead of the human table.
         #[arg(long)]
@@ -74,16 +85,16 @@ enum Command {
         zero: bool,
         name: String,
     },
-    /// Remove a worktree, terminate its managed agent session, and delete its paired branch.
+    /// Remove a worktree, terminate its legacy tmux session if present, and delete its branch.
     ///
     /// Without `--force`, dirty worktrees are rejected. With it, uncommitted worktree changes
     /// may be discarded. A clean worktree can be removed without it, even when the branch has
     /// unmerged commits.
     ///
-    /// Removal always terminates the session, removes the worktree, atomically deletes the
-    /// paired local branch if it remains unchanged, and then removes david's session metadata.
-    /// Branch-only commits are intentionally lost. Branch deletion does not require a merged
-    /// branch and is not configurable.
+    /// Removal terminates a legacy managed session when one exists, removes the worktree,
+    /// atomically deletes the paired local branch if it remains unchanged, and then removes
+    /// David's session metadata. Branch-only commits are intentionally lost. Branch deletion
+    /// does not require a merged branch and is not configurable.
     ///
     /// Both `david remove <name> --force` and `david remove --force <name>` are supported.
     Remove {
@@ -122,6 +133,22 @@ fn terminal_interaction_allowed(
     !no_interactive && stdin_is_terminal && stderr_is_terminal
 }
 
+fn execute_run<S: SessionBackend>(
+    app: &App<S>,
+    cwd: &Path,
+    name: Option<String>,
+    options: RunOptions,
+    name_selection_allowed: bool,
+) -> Result<()> {
+    match name {
+        Some(name) => app.run_with_options(cwd, &name, options),
+        None if name_selection_allowed => app.run_interactive(cwd, options),
+        None => Err(ToolError::Message(
+            "non-interactive run requires a worktree name".to_owned(),
+        )),
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = DavidPaths::from_env()?;
@@ -134,43 +161,65 @@ fn run() -> Result<()> {
         }
         command => {
             let cwd = env::current_dir()?;
-            let app = App::new(paths, TmuxBackend::default());
             match command {
                 Command::Run {
                     name,
                     agent,
+                    tmux,
                     detach,
                     no_interactive,
                     agent_args,
                 } => {
-                    let interactive = terminal_interaction_allowed(
+                    let selection_interactive = terminal_interaction_allowed(
                         no_interactive,
                         io::stdin().is_terminal(),
                         io::stderr().is_terminal(),
                     );
-                    let options = RunOptions {
-                        agent,
-                        agent_args,
-                        interactive,
-                        attach: !detach && interactive,
-                    };
-                    match name {
-                        Some(name) => app.run_with_options(&cwd, &name, options),
-                        None => {
-                            if interactive {
-                                app.run_interactive(&cwd, options)
-                            } else {
-                                Err(ToolError::Message(
-                                    "non-interactive run requires a worktree name".to_owned(),
-                                ))
-                            }
+                    if tmux || detach {
+                        let options = RunOptions {
+                            agent,
+                            agent_args,
+                            interactive: selection_interactive,
+                            attach: !detach && selection_interactive,
+                        };
+                        execute_run(
+                            &App::new(paths, TmuxBackend::default()),
+                            &cwd,
+                            name,
+                            options,
+                            selection_interactive,
+                        )
+                    } else {
+                        if !selection_interactive
+                            && !direct_agent_is_resolvable(&paths, agent.as_deref())?
+                        {
+                            return Err(ToolError::AgentSelectionUnavailable);
                         }
+                        let options = RunOptions {
+                            agent,
+                            agent_args,
+                            interactive: true,
+                            attach: true,
+                        };
+                        execute_run(
+                            &App::new(paths, DirectBackend::default()),
+                            &cwd,
+                            name,
+                            options,
+                            selection_interactive,
+                        )
                     }
                 }
-                Command::Edit { worktree } => app.edit(&cwd, &worktree),
-                Command::Attach { name } => app.attach(&cwd, &name),
-                Command::Prompt { worktree, message } => app.prompt(&cwd, &worktree, &message),
+                Command::Edit { worktree } => {
+                    App::new(paths, DirectBackend::default()).edit(&cwd, &worktree)
+                }
+                Command::Attach { name } => {
+                    App::new(paths, TmuxBackend::default()).attach(&cwd, &name)
+                }
+                Command::Prompt { worktree, message } => App::new(paths, TmuxBackend::default())
+                    .prompt(&cwd, &worktree, &message),
                 Command::List { porcelain, zero } => {
+                    let app = App::new(paths, DirectBackend::default());
                     let stdout = io::stdout();
                     let is_terminal = stdout.is_terminal();
                     let mut output = stdout.lock();
@@ -183,9 +232,12 @@ fn run() -> Result<()> {
                 Command::Path { name, zero } => {
                     let stdout = io::stdout();
                     let mut output = stdout.lock();
-                    app.path(&cwd, &name, zero, &mut output)
+                    App::new(paths, DirectBackend::default())
+                        .path(&cwd, &name, zero, &mut output)
                 }
-                Command::Remove { name, force } => app.remove(&cwd, &name, force),
+                Command::Remove { name, force } => {
+                    App::new(paths, DirectBackend::default()).remove(&cwd, &name, force)
+                }
                 Command::Setup => unreachable!(),
                 Command::Migrate { .. } => unreachable!(),
             }
@@ -233,10 +285,9 @@ mod tests {
             .to_string();
 
         for expected in [
-            "terminates the session",
+            "terminates a legacy managed session",
             "removes the worktree",
-            "atomically deletes the",
-            "paired local branch if it remains unchanged",
+            "atomically deletes the paired local branch if it remains unchanged",
             "Branch-only commits are intentionally lost",
             "Without `--force`, dirty worktrees are rejected",
             "Discard uncommitted worktree changes; without it, dirty worktrees are rejected. It does not control branch deletion",
@@ -250,13 +301,12 @@ mod tests {
     }
 
     #[test]
-    fn run_cli_preserves_runtime_argument_boundaries() {
+    fn run_cli_defaults_to_direct_and_preserves_runtime_argument_boundaries() {
         let cli = Cli::try_parse_from([
             "david",
             "run",
             "-a",
             "codex",
-            "-d",
             "feature-login",
             "--",
             "--model",
@@ -269,18 +319,56 @@ mod tests {
             Command::Run {
                 name,
                 agent,
+                tmux,
                 detach,
                 no_interactive,
                 agent_args,
             } => {
                 assert_eq!(name.as_deref(), Some("feature-login"));
                 assert_eq!(agent.as_deref(), Some("codex"));
-                assert!(detach);
+                assert!(!tmux);
+                assert!(!detach);
                 assert!(!no_interactive);
                 assert_eq!(agent_args, ["--model", "gpt 5.6", "$()"]);
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn run_cli_supports_explicit_legacy_tmux_mode() {
+        let cli = Cli::try_parse_from([
+            "david",
+            "run",
+            "--tmux",
+            "-a",
+            "claude",
+            "feature-login",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                tmux: true,
+                detach: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn detach_remains_available_as_a_legacy_tmux_operation() {
+        let cli = Cli::try_parse_from(["david", "run", "-d", "feature-login"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                tmux: false,
+                detach: true,
+                ..
+            }
+        ));
     }
 
     #[test]
