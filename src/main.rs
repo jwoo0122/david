@@ -338,9 +338,8 @@ mod tests {
 
     #[test]
     fn run_cli_supports_explicit_legacy_tmux_mode() {
-        let cli =
-            Cli::try_parse_from(["david", "run", "--tmux", "-a", "claude", "feature-login"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["david", "run", "--tmux", "-a", "claude", "feature-login"])
+            .unwrap();
 
         assert!(matches!(
             cli.command,
