@@ -137,8 +137,17 @@ fn run_execs_the_agent_directly_in_the_managed_worktree_by_default() {
     );
 
     let session_dir = home.path().join(".local/state/david/sessions");
+    let state_files = if session_dir.exists() {
+        fs::read_dir(session_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("state"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     assert!(
-        !session_dir.exists() || fs::read_dir(session_dir).unwrap().next().is_none(),
-        "direct execution must not leave managed session state"
+        state_files.is_empty(),
+        "direct execution must not leave managed session state: {state_files:?}"
     );
 }
